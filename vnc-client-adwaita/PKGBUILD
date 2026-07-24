@@ -1,0 +1,45 @@
+# Maintainer: OpenClaw Contributors <https://github.com/weihuoya/openclaw>
+pkgname=vnc-client-adwaita
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Adwaita GTK4 VNC client with GSettings persistence"
+arch=(x86_64)
+url="https://github.com/weihuoya/openclaw"
+license=('MIT' 'Apache-2.0')
+options=(!lto)
+depends=('gtk4' 'libadwaita' 'libepoxy' 'glib2' 'gstreamer' 'gst-plugins-base-libs')
+makedepends=('cargo' 'git' 'gettext')
+source=("$pkgname::git+https://github.com/weihuoya/openclaw.git")
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname/vnc-client-adwaita"
+    cargo build --locked --release --bin vnc-client-adwaita
+}
+
+check() {
+    cd "$pkgname/vnc-client-adwaita"
+    cargo test --release --bin vnc-client-adwaita
+}
+
+package() {
+    cd "$pkgname"
+
+    install -Dm755 "target/release/vnc-client-adwaita" "$pkgdir/usr/bin/vnc-client-adwaita"
+    install -Dm644 "vnc-client-adwaita/data/com.weiz.vnc-client-adwaita.gschema.xml" \
+        "$pkgdir/usr/share/glib-2.0/schemas/com.weiz.vnc-client-adwaita.gschema.xml"
+    install -Dm644 "vnc-client-adwaita/data/icons/hicolor/64x64/apps/com.weiz.vnc-client-adwaita.svg" \
+        "$pkgdir/usr/share/icons/hicolor/64x64/apps/com.weiz.vnc-client-adwaita.svg"
+
+    for mo in vnc-client-adwaita/locale/*/LC_MESSAGES/com.weiz.vnc-client-adwaita.mo; do
+        [ -e "$mo" ] || continue
+        lang=$(basename "$(dirname "$(dirname "$mo")")")
+        install -Dm644 "$mo" \
+            "$pkgdir/usr/share/locale/$lang/LC_MESSAGES/com.weiz.vnc-client-adwaita.mo"
+    done
+
+    install -Dm644 "vnc-client-adwaita/data/com.weiz.vnc-client-adwaita.desktop" \
+        "$pkgdir/usr/share/applications/com.weiz.vnc-client-adwaita.desktop"
+
+    install -Dm644 "vnc-client-adwaita/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

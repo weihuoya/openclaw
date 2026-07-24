@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="com.weiz.vnc-client-adwaita">
+  <schema id="com.weiz.vnc-client-adwaita" path="/com/weiz/vnc-adwaita/">
+    <key name="host" type="s">
+      <default>''</default>
+      <summary>Last VNC host</summary>
+      <description>Hostname or IP address of the last VNC server.</description>
+    </key>
+    <key name="port" type="u">
+      <default>5900</default>
+      <summary>Last VNC port</summary>
+      <description>TCP port of the last VNC server.</description>
+    </key>
+    <key name="username" type="s">
+      <default>''</default>
+      <summary>Username for SASL/VeNCrypt</summary>
+      <description>Username used by authentication methods that require it.</description>
+    </key>
+    <key name="auth-method" type="s">
+      <default>'none'</default>
+      <summary>Authentication method</summary>
+      <description>Either 'none' or 'password'.</description>
+    </key>
+    <key name="preferred-encoding" type="s">
+      <default>'zrle'</default>
+      <summary>Preferred VNC encoding</summary>
+      <description>Encoding requested first. Supported: zrle, hextile, raw, copyrect, trle, rre, tight, openh264.</description>
+    </key>
+    <key name="view-only" type="b">
+      <default>false</default>
+      <summary>View only</summary>
+      <description>Do not send mouse or keyboard events to the server.</description>
+    </key>
+    <key name="scale-to-fit" type="b">
+      <default>true</default>
+      <summary>Scale to fit</summary>
+      <description>Scale the remote desktop to fit the window.</description>
+    </key>
+  </schema>
+</schemalist>

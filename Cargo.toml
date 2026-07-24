@@ -1,0 +1,17 @@
+[workspace]
+members = ["vnc-client", "vnc-widget-gtk4", "vnc-client-android", "vnc-client-adwaita"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/weihuoya/openclaw"
+
+[workspace.dependencies]
+gtk4 = { version = "0.11", package = "gtk4", features = ["v4_14"] }
+gdk4 = { version = "0.11", package = "gdk4", features = ["v4_14"] }
+glib = { version = "0.22", package = "glib" }
+gio = { version = "0.22", package = "gio" }
+graphene-rs = { version = "0.22", package = "graphene-rs" }

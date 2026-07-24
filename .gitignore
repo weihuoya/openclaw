@@ -1,0 +1,7 @@
+target/
+*.log
+gschemas.compiled
+vnc-client-adwaita/locale/
+vnc-client-adwaita/build/
+vnc-client-adwaita/data/com.weiz.vnc-client-adwaita.desktop
+*.pkg.tar.*

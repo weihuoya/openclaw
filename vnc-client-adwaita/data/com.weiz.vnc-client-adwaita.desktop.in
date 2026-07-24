@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=VNC Client
+Comment=A simple VNC client built with libadwaita and GTK4
+Exec=vnc-client-adwaita
+Icon=com.weiz.vnc-client-adwaita
+Type=Application
+Categories=Network;RemoteAccess;
+Keywords=vnc;remote;desktop;
+Terminal=false
+StartupNotify=true

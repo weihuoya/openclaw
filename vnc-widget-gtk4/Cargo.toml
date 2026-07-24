@@ -1,0 +1,20 @@
+[package]
+name = "vnc-widget-gtk4"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GTK4 VNC display widget with GPU-accelerated rendering"
+
+[dependencies]
+gtk4 = { workspace = true }
+gdk4 = { workspace = true }
+glib = { workspace = true }
+graphene-rs = { workspace = true }
+vnc-client = { path = "../vnc-client" }
+log = "0.4"
+
+[lib]
+name = "gtk4_vnc"
+crate-type = ["lib"]

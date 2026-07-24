@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-vnc-client:
+    name: Build vnc-client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build vnc-client
+        run: cd vnc-client && cargo build --all-features
+
+      - name: Test vnc-client
+        run: cd vnc-client && cargo test --all-features
+
+  build-vnc-widget-gtk4:
+    name: Build vnc-widget-gtk4
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libepoxy-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build vnc-widget-gtk4
+        run: cd vnc-widget-gtk4 && cargo build --all-features
+
+      - name: Test vnc-widget-gtk4
+        run: cd vnc-widget-gtk4 && cargo test --all-features --lib
+
+  build-vnc-client-android:
+    name: Build vnc-client-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: |
+          cargo install cargo-ndk
+          cargo ndk --version
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          link-to-sdk: true
+
+      - name: Debug NDK env
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+          ls -la "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/" | head -20 || true
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build vnc-client for Android (API 30)
+        run: |
+          set -e
+          # Check vnc-client core compiles for Android first
+          echo "=== Checking vnc-client core ==="
+          cargo ndk --target aarch64-linux-android --platform 30 check -p vnc-client 2>&1
+          # Then check vnc-client-android
+          echo "=== Checking vnc-client-android ==="
+          cargo ndk --target aarch64-linux-android --platform 30 check -p vnc-client-android 2>&1

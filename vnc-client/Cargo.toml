@@ -1,0 +1,33 @@
+[package]
+name = "vnc-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A Rust VNC client library implementing the RFB protocol"
+
+[dependencies]
+thiserror = "2.0"
+log = "0.4"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+des = "0.9"
+cipher = "0.5"
+jpeg-decoder = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "0.26"
+rsa = "0.9"
+aes = "0.8"
+ctr = "0.9"
+rand = "0.8"
+sha2 = "0.10"
+sasl = { version = "0.5.2", features = ["scram"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+
+# Platform-specific video decoder backends
+[target.'cfg(not(target_os = "android"))'.dependencies]
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", features = ["media"] }

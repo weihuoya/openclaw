@@ -1,0 +1,18 @@
+[package]
+name = "vnc-client-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Android VNC display with OpenGL ES 3 rendering and NdkMediaCodec"
+
+[dependencies]
+vnc-client = { path = "../vnc-client" }
+log = "0.4"
+ndk = { version = "0.9", features = ["nativewindow", "media"] }
+ndk-sys = "0.6"
+
+[lib]
+name = "vnc_client_android"
+crate-type = ["cdylib", "staticlib"]

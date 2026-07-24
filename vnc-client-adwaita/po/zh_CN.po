@@ -1,0 +1,149 @@
+# VNC Client Adwaita UI strings (Simplified Chinese)
+# Copyright (C) 2026 OpenClaw Contributors
+# This file is distributed under the same license as the openclaw package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: vnc-client-adwaita 0.1.0\n"
+"Report-Msgid-Bugs-To: https://github.com/weihuoya/openclaw\n"
+"POT-Creation-Date: 2026-07-20 11:00+0800\n"
+"PO-Revision-Date: 2026-07-20 11:00+0800\n"
+"Last-Translator: OpenClaw Contributors\n"
+"Language-Team: Chinese (Simplified)\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#: src/main.rs
+msgid "GSettings schema '{}' not found."
+msgstr "找不到 GSettings 配置 '{}'。"
+
+#: src/main.rs
+msgid "Compile it with: glib-compile-schemas vnc-client-adwaita/data/"
+msgstr "使用以下命令编译：glib-compile-schemas vnc-client-adwaita/data/"
+
+#: src/main.rs
+msgid "Run with: GSETTINGS_SCHEMA_DIR=vnc-client-adwaita/data cargo run -p vnc-client-adwaita"
+msgstr "运行方式：GSETTINGS_SCHEMA_DIR=vnc-client-adwaita/data cargo run -p vnc-client-adwaita"
+
+#: src/main.rs
+msgid "VNC Client"
+msgstr "VNC 客户端"
+
+#: src/main.rs
+msgid "Host"
+msgstr "主机"
+
+#: src/main.rs
+msgid "Password"
+msgstr "密码"
+
+#: src/main.rs
+msgid "Connect"
+msgstr "连接"
+
+#: src/main.rs
+msgid "Disconnect"
+msgstr "断开"
+
+#: src/main.rs
+msgid "Preferences"
+msgstr "首选项"
+
+#: src/main.rs
+msgid "Host cannot be empty"
+msgstr "主机不能为空"
+
+#: src/main.rs
+msgid "Password is required"
+msgstr "需要密码"
+
+#: src/main.rs
+msgid "General"
+msgstr "常规"
+
+#: src/main.rs
+msgid "Connection"
+msgstr "连接"
+
+#: src/main.rs
+msgid "Port"
+msgstr "端口"
+
+#: src/main.rs
+msgid "Authentication method"
+msgstr "认证方式"
+
+#: src/main.rs
+msgid "Username"
+msgstr "用户名"
+
+#: src/main.rs
+msgid "View"
+msgstr "视图"
+
+#: src/main.rs
+msgid "View only"
+msgstr "仅查看"
+
+#: src/main.rs
+msgid "Scale to fit"
+msgstr "缩放以适应"
+
+#: src/main.rs
+msgid "Preferred encoding"
+msgstr "首选编码"
+
+#: src/main.rs
+msgid "none or password"
+msgstr "无 或 密码"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Last VNC host"
+msgstr "上次 VNC 主机"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Hostname or IP address of the last VNC server."
+msgstr "上次 VNC 服务器的主机名或 IP 地址。"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Last VNC port"
+msgstr "上次 VNC 端口"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "TCP port of the last VNC server."
+msgstr "上次 VNC 服务器的 TCP 端口。"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Username for SASL/VeNCrypt"
+msgstr "SASL/VeNCrypt 用户名"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Username used by authentication methods that require it."
+msgstr "需要用户名时使用的认证用户名。"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Either 'none' or 'password'."
+msgstr "可以是 'none' 或 'password'。"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Preferred VNC encoding"
+msgstr "首选 VNC 编码"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Encoding requested first. Supported: zrle, hextile, raw, copyrect, trle, rre, tight, openh264."
+msgstr "优先请求的编码。支持：zrle、hextile、raw、copyrect、trle、rre、tight、openh264。"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Do not send mouse or keyboard events to the server."
+msgstr "不向服务器发送鼠标或键盘事件。"
+
+#: data/com.weiz.vnc-client-adwaita.gschema.xml
+msgid "Scale the remote desktop to fit the window."
+msgstr "将远程桌面缩放以适应窗口。"
+
+#: data/com.weiz.vnc-client-adwaita.desktop.in
+msgid "A simple VNC client built with libadwaita and GTK4"
+msgstr "基于 libadwaita 和 GTK4 的简洁 VNC 客户端"
