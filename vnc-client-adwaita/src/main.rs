@@ -4,7 +4,7 @@ use glib::clone;
 use gtk4::{gio, glib};
 use gtk4_vnc::HandshakeResult;
 use gtk4_vnc::VncDisplay;
-use vnc_client::auth::{NoAuthHandler, PasswordAuthHandler};
+use vnc_client::auth::{AppleDhAuthHandler, NoAuthHandler, PasswordAuthHandler};
 use vnc_client::encodings::Encoding;
 
 use gettextrs::{bindtextdomain, gettext, setlocale, textdomain, LocaleCategory};
@@ -109,6 +109,9 @@ fn build_ui(app: &adw::Application) {
     stats_revealer.set_child(Some(&stats_label));
     stats_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
     stats_revealer.set_reveal_child(false);
+    stats_revealer.set_halign(gtk4::Align::Start);
+    stats_revealer.set_valign(gtk4::Align::Start);
+    stats_revealer.set_can_target(false);
 
     let display_overlay = gtk4::Overlay::new();
     display_overlay.set_child(Some(&vnc_display));
@@ -281,8 +284,11 @@ fn show_connect_dialog(
     password_row.set_title(&gettext("Password"));
     password_row.set_activates_default(true);
 
-    // Username and password are only meaningful for password-based authentication.
-    let auth_requires_credentials = settings.string("auth-method").as_str() == "password";
+    // Username and password are required for VNC password auth and Apple DH.
+    let auth_requires_credentials = matches!(
+        settings.string("auth-method").as_str(),
+        "password" | "apple-dh"
+    );
     user_row.set_visible(auth_requires_credentials);
     password_row.set_visible(auth_requires_credentials);
     settings.connect_changed(
@@ -293,7 +299,10 @@ fn show_connect_dialog(
             #[weak]
             password_row,
             move |settings, _key| {
-                let visible = settings.string("auth-method").as_str() == "password";
+                let visible = matches!(
+                    settings.string("auth-method").as_str(),
+                    "password" | "apple-dh"
+                );
                 user_row.set_visible(visible);
                 password_row.set_visible(visible);
             }
@@ -310,8 +319,8 @@ fn show_connect_dialog(
     // Options group (previously in the Preferences window)
     let auth_row = combo_row_for_settings(
         &gettext("Authentication method"),
-        &["none", "password"],
-        &settings,
+        &["none", "password", "apple-dh"],
+        settings,
         "auth-method",
     );
 
@@ -320,7 +329,7 @@ fn show_connect_dialog(
         &[
             "zrle", "hextile", "raw", "copyrect", "trle", "rre", "tight", "openh264",
         ],
-        &settings,
+        settings,
         "preferred-encoding",
     );
 
@@ -366,7 +375,7 @@ fn show_connect_dialog(
     toolbar_view.add_bottom_bar(&button_box);
 
     let dialog = adw::Dialog::builder()
-        .title(&gettext("Connect to VNC server"))
+        .title(gettext("Connect to VNC server"))
         .child(&toolbar_view)
         .content_width(560)
         .content_height(640)
@@ -449,8 +458,8 @@ fn show_connect_dialog(
             let _ = settings.set_string("username", &username);
 
             let auth_method = settings.string("auth-method");
-            let auth: Box<dyn vnc_client::auth::AuthHandler + Send> =
-                if auth_method.as_str() == "password" {
+            let auth: Box<dyn vnc_client::auth::AuthHandler + Send> = match auth_method.as_str() {
+                "password" => {
                     if password.is_empty() {
                         let msg = gettext("Password is required");
                         log::error!("{}", msg);
@@ -458,9 +467,27 @@ fn show_connect_dialog(
                         return;
                     }
                     Box::new(PasswordAuthHandler::new(password.to_string()))
-                } else {
-                    Box::new(NoAuthHandler)
-                };
+                }
+                "apple-dh" => {
+                    if username.is_empty() {
+                        let msg = gettext("Username is required for Apple Remote Desktop");
+                        log::error!("{}", msg);
+                        toast_overlay.add_toast(adw::Toast::new(&msg));
+                        return;
+                    }
+                    if password.is_empty() {
+                        let msg = gettext("Password is required for Apple Remote Desktop");
+                        log::error!("{}", msg);
+                        toast_overlay.add_toast(adw::Toast::new(&msg));
+                        return;
+                    }
+                    Box::new(AppleDhAuthHandler::new(
+                        username.to_string(),
+                        password.to_string(),
+                    ))
+                }
+                _ => Box::new(NoAuthHandler),
+            };
 
             let preferred = settings.string("preferred-encoding");
             let encodings = build_encoding_list(&preferred);
@@ -528,6 +555,9 @@ fn update_auth_row_from_supported_types(
     }
     if supported_types.contains(&2) {
         options.push("password");
+    }
+    if supported_types.contains(&30) {
+        options.push("apple-dh");
     }
     if options.is_empty() {
         // The server offered nothing we can use; leave a placeholder so the

@@ -60,16 +60,14 @@ impl VencryptHandler {
             *subtype = u32::from_be_bytes(buf);
         }
 
-        // Preference: TLS > RSA-AES-256 > RSA-AES > X509 > SASL > None > VNCAuth
-        // Apple DH (30) is deliberately omitted because the implementation
-        // is currently a placeholder that sends a zero public key and will
-        // always fail. Do not place it ahead of working mechanisms.
+        // Preference: strongest first, weakest last.
         let preferred = [
             2u32, // TLS
             27,   // RSA-AES-256
             26,   // RSA-AES
             256,  // X509
             22,   // SASL
+            30,   // Apple DH (functional but uses ECB/MD5; kept as fallback)
             0,    // None
             1,    // VNCAuth
         ];

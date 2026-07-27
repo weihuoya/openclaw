@@ -90,6 +90,8 @@ mod imp {
         // Input state
         pub button_mask: Cell<u8>,
         pub view_only: Cell<bool>,
+        pub last_x: Cell<f64>,
+        pub last_y: Cell<f64>,
     }
 
     #[glib::object_subclass]
@@ -104,10 +106,12 @@ mod imp {
             self.parent_constructed();
             let obj = self.obj();
             obj.set_focusable(true);
-            obj.set_can_focus(true);
+            obj.set_sensitive(true);
+            obj.set_can_target(true);
 
             // Motion controller for mouse movement
             let motion = gtk4::EventControllerMotion::new();
+            motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
             let obj_weak = obj.downgrade();
             motion.connect_motion(move |_, x, y| {
                 if let Some(obj) = obj_weak.upgrade() {
@@ -119,6 +123,7 @@ mod imp {
             // Gesture click for mouse buttons
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(0);
+            gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
             let obj_weak = obj.downgrade();
             gesture.connect_pressed(move |gesture, _n_press, x, y| {
                 if let Some(obj) = obj_weak.upgrade() {
@@ -137,6 +142,7 @@ mod imp {
 
             // Key controller for keyboard
             let key = gtk4::EventControllerKey::new();
+            key.set_propagation_phase(gtk4::PropagationPhase::Capture);
             let obj_weak = obj.downgrade();
             key.connect_key_pressed(move |_, keyval, _keycode, _state| {
                 if let Some(obj) = obj_weak.upgrade() {
@@ -151,6 +157,22 @@ mod imp {
                 }
             });
             obj.add_controller(key);
+
+            // Scroll controller for mouse wheel
+            let scroll = gtk4::EventControllerScroll::new(
+                gtk4::EventControllerScrollFlags::VERTICAL
+                    | gtk4::EventControllerScrollFlags::HORIZONTAL
+                    | gtk4::EventControllerScrollFlags::DISCRETE,
+            );
+            scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let obj_weak = obj.downgrade();
+            scroll.connect_scroll(move |_, dx, dy| {
+                if let Some(obj) = obj_weak.upgrade() {
+                    obj.imp().on_scroll(dx, dy);
+                }
+                glib::Propagation::Proceed
+            });
+            obj.add_controller(scroll);
         }
 
         fn dispose(&self) {
@@ -160,8 +182,8 @@ mod imp {
 
     impl WidgetImpl for VncDisplayImp {
         fn measure(&self, orientation: gtk4::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
-            let width = self.width.get();
-            let height = self.height.get();
+            let width = self.width.get().max(1);
+            let height = self.height.get().max(1);
             match orientation {
                 gtk4::Orientation::Horizontal => (width, width, -1, -1),
                 gtk4::Orientation::Vertical => (height, height, -1, -1),
@@ -217,15 +239,18 @@ mod imp {
         }
 
         fn on_motion(&self, x: f64, y: f64) {
+            self.last_x.set(x);
+            self.last_y.set(y);
             let (vx, vy) = self.scale_coords(x, y);
             self.send_input(InputEvent::Pointer {
-                button_mask: 0,
+                button_mask: self.button_mask.get(),
                 x: vx,
                 y: vy,
             });
         }
 
         fn on_button_press(&self, button: u8, x: f64, y: f64) {
+            self.obj().grab_focus();
             let (vx, vy) = self.scale_coords(x, y);
             let bit = match button {
                 1 => 1 << 0,
@@ -269,6 +294,36 @@ mod imp {
             self.send_input(InputEvent::Key {
                 down: false,
                 keysym,
+            });
+        }
+
+        fn on_scroll(&self, dx: f64, dy: f64) {
+            // RFB pointer events encode wheel directions as transient button masks:
+            // bit 3 = scroll up, bit 4 = scroll down, bit 5 = scroll left,
+            // bit 6 = scroll right. Send a press followed by a release so the
+            // server sees a single click of the wheel.
+            let bit = if dy < 0.0 {
+                1 << 3 // up
+            } else if dy > 0.0 {
+                1 << 4 // down
+            } else if dx < 0.0 {
+                1 << 5 // left
+            } else if dx > 0.0 {
+                1 << 6 // right
+            } else {
+                return;
+            };
+            let base_mask = self.button_mask.get();
+            let (x, y) = self.scale_coords(self.last_x.get(), self.last_y.get());
+            self.send_input(InputEvent::Pointer {
+                button_mask: base_mask | bit,
+                x,
+                y,
+            });
+            self.send_input(InputEvent::Pointer {
+                button_mask: base_mask,
+                x,
+                y,
             });
         }
 
@@ -424,7 +479,7 @@ impl VncDisplay {
             let cursor_data = cursor_data.clone();
             // Most VNC servers default to little-endian BGRA; keep the previous
             // behavior while the pixel-format helpers are now correctly named.
-            let server_format = client.pixel_format().clone();
+            let server_format = *client.pixel_format();
             if let Err(e) = client.set_pixel_format(vnc_client::PixelFormat::bgra32()) {
                 log::warn!(
                     "Failed to set pixel format to BGRA32 ({}); using server format {:?}",
@@ -442,14 +497,21 @@ impl VncDisplay {
             let (w, h) = client.dimensions();
             let _ = client.request_update(false, 0, 0, w, h);
 
-            // Enable continuous updates if supported
-            let _ = client.enable_continuous_updates(true, 0, 0, w, h);
+            // Note: Some servers (notably macOS Screen Sharing) close the
+            // connection when they receive the EnableContinuousUpdates message,
+            // even though we advertise the pseudo-encoding. Fall back to
+            // periodic incremental update requests instead.
+            let continuous_updates = false;
+            if continuous_updates {
+                let _ = client.enable_continuous_updates(true, 0, 0, w, h);
+            }
 
             // Set read timeout so we can check input channel periodically
             let _ = client.set_read_timeout(Some(Duration::from_millis(50)));
 
             let mut last_activity = Instant::now();
             let mut last_stats_sample = Instant::now();
+            let mut last_update_request = Instant::now();
 
             while running_bg.load(Ordering::SeqCst) {
                 // Check for input events
@@ -478,6 +540,15 @@ impl VncDisplay {
                 if last_activity.elapsed() >= Duration::from_secs(5) {
                     let _ = client.send_pointer_event(0, 0, 0);
                     last_activity = Instant::now();
+                }
+
+                // Poll for updates when continuous updates are not enabled.
+                if !continuous_updates
+                    && last_update_request.elapsed() >= Duration::from_millis(100)
+                {
+                    let (w, h) = client.dimensions();
+                    let _ = client.request_update(true, 0, 0, w, h);
+                    last_update_request = Instant::now();
                 }
 
                 // Read server messages (with timeout)
@@ -570,7 +641,11 @@ impl VncDisplay {
             };
 
             let has_updates = !updates.is_empty();
+            let mut size_changed = false;
             for data in updates {
+                if imp.width.get() != data.width || imp.height.get() != data.height {
+                    size_changed = true;
+                }
                 imp.width.set(data.width);
                 imp.height.set(data.height);
                 if let Some(ref paintable) = *imp.paintable.borrow() {
@@ -580,6 +655,9 @@ impl VncDisplay {
 
             if has_updates {
                 obj.queue_draw();
+            }
+            if size_changed {
+                obj.queue_resize();
             }
 
             // Process cursor updates

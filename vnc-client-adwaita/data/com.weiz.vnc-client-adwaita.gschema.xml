@@ -19,7 +19,7 @@
     <key name="auth-method" type="s">
       <default>'none'</default>
       <summary>Authentication method</summary>
-      <description>Either 'none' or 'password'.</description>
+      <description>One of 'none', 'password', or 'apple-dh' (Apple Remote Desktop).</description>
     </key>
     <key name="preferred-encoding" type="s">
       <default>'zrle'</default>

@@ -82,6 +82,7 @@ pub mod tls;
 pub mod trle;
 pub mod vencrypt;
 pub mod ws;
+pub mod zlib;
 pub mod zrle;
 
 use auth::AuthHandler;
@@ -98,8 +99,8 @@ pub use stats::ConnectionStats;
 enum VncStreamInner {
     Plain(TcpStream),
     Tls(Box<TlsStream>),
-    Aes(rsa_aes::AesCfbStream),
-    Ws(ws::WsStream),
+    Aes(Box<rsa_aes::AesCfbStream>),
+    Ws(Box<ws::WsStream>),
 }
 
 impl VncStreamInner {
@@ -239,6 +240,9 @@ pub struct VncClient {
     name: String,
     width: u16,
     height: u16,
+    /// Value sent in the ClientInit shared byte. Apple DH type 30 uses 0x1C
+    /// to trigger Apple's extended session setup.
+    client_init_shared: u8,
     h264_decoder: Option<Box<dyn decoder::VideoDecoder>>,
     encodings: Vec<Encoding>,
     host: String,
@@ -246,6 +250,7 @@ pub struct VncClient {
     sasl_password: String,
     server_security_types: Vec<u8>,
     zrle_decompress: Option<Decompress>,
+    zlib_decompress: Option<Decompress>,
     stats_tracker: stats::ConnectionStatsTracker,
     /// Current read timeout, so handlers like Raw can temporarily extend it
     /// for large data reads and restore it afterwards.
@@ -360,6 +365,7 @@ impl VncClient {
             name: String::new(),
             width: 0,
             height: 0,
+            client_init_shared: 1,
             h264_decoder: None,
             encodings: Vec::new(),
             host: String::new(),
@@ -367,6 +373,7 @@ impl VncClient {
             sasl_password: String::new(),
             server_security_types: Vec::new(),
             zrle_decompress: None,
+            zlib_decompress: None,
             stats_tracker: stats::ConnectionStatsTracker::new(),
             read_timeout: None,
             last_msg_type: None,
@@ -414,7 +421,7 @@ impl VncClient {
     pub fn connect_ws(&mut self, url: &str) -> Result<(), VncError> {
         let stream = ws::WsStream::connect(url)?;
         self.stream = Some(VncStream {
-            inner: VncStreamInner::Ws(stream),
+            inner: VncStreamInner::Ws(Box::new(stream)),
             bytes_read: 0,
             bytes_written: 0,
         });
@@ -461,6 +468,9 @@ impl VncClient {
         }
 
         let our_version = match version {
+            // Some servers advertise 003.889 to indicate vendor extensions, but
+            // the wire protocol is compatible with 003.008, so downgrade to 003.008.
+            "RFB 003.889" => b"RFB 003.008\n",
             "RFB 003.008" => b"RFB 003.008\n",
             "RFB 003.007" => b"RFB 003.007\n",
             "RFB 003.003" => b"RFB 003.003\n",
@@ -469,6 +479,54 @@ impl VncClient {
 
         stream.write_all(our_version)?;
         self.state = ClientState::HandshakeVersion;
+        Ok(())
+    }
+
+    /// Upgrade the current Plain TCP stream to TLS.
+    /// Used by both TLS and X509 VeNCrypt sub-types.
+    fn upgrade_to_tls(&mut self) -> Result<(), VncError> {
+        let (tcp, bytes_read, bytes_written) = match self.stream.take() {
+            Some(VncStream {
+                inner: VncStreamInner::Plain(tcp),
+                bytes_read,
+                bytes_written,
+            }) => (tcp, bytes_read, bytes_written),
+            Some(VncStream {
+                inner: VncStreamInner::Tls(_),
+                ..
+            }) => {
+                return Err(VncError::Protocol("Already TLS".to_string()));
+            }
+            Some(VncStream {
+                inner: VncStreamInner::Aes(_),
+                ..
+            }) => {
+                return Err(VncError::Protocol(
+                    "Cannot upgrade AES stream to TLS".to_string(),
+                ));
+            }
+            Some(VncStream {
+                inner: VncStreamInner::Ws(_),
+                ..
+            }) => {
+                return Err(VncError::Protocol(
+                    "WebSocket not supported for VeNCrypt auth".to_string(),
+                ));
+            }
+            None => return Err(VncError::NotConnected),
+        };
+        let host = self.host.clone();
+        if host.is_empty() {
+            return Err(VncError::Protocol(
+                "Host not set for TLS upgrade".to_string(),
+            ));
+        }
+        let tls = TlsStream::from_tcp(tcp, &host)?;
+        self.stream = Some(VncStream {
+            inner: VncStreamInner::Tls(Box::new(tls)),
+            bytes_read,
+            bytes_written,
+        });
         Ok(())
     }
 
@@ -493,11 +551,13 @@ impl VncClient {
             let mut types = vec![0u8; num_types];
             stream.read_exact(&mut types)?;
             self.server_security_types = types.clone();
+            log::debug!("Server offered security types: {:?}", types);
 
+            // Let the auth handler decide which non-VeNCrypt type to use. This
+            // allows handlers like AppleDhAuthHandler to select type 30 while
+            // NoAuthHandler and PasswordAuthHandler continue to prefer 1 / 2.
             let selected = if types.contains(&19) {
                 19u8 // VeNCrypt
-            } else if types.contains(&1) {
-                1u8
             } else {
                 auth.select_security_type(&types)?
             };
@@ -519,6 +579,13 @@ impl VncClient {
             2 => {
                 let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                 auth.authenticate_vnc(stream)?;
+            }
+            30 => {
+                let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+                auth.authenticate(stream, 30)?;
+                // Apple's RFB type 30 uses a non-standard ClientInit shared byte.
+                // 0x1C triggers the extended session setup used by macOS Screen Sharing.
+                self.client_init_shared = 0x1C;
             }
             19 => {
                 let result = {
@@ -543,49 +610,7 @@ impl VncClient {
                         auth.authenticate_vnc(stream)?;
                     }
                     vencrypt::VencryptResult::Tls => {
-                        let (tcp, bytes_read, bytes_written) = match self.stream.take() {
-                            Some(VncStream {
-                                inner: VncStreamInner::Plain(tcp),
-                                bytes_read,
-                                bytes_written,
-                            }) => (tcp, bytes_read, bytes_written),
-                            Some(VncStream {
-                                inner: VncStreamInner::Tls(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol("Already TLS".to_string()));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Aes(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Cannot upgrade AES stream to TLS".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Ws(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "WebSocket not supported for VeNCrypt auth".to_string(),
-                                ));
-                            }
-                            None => return Err(VncError::NotConnected),
-                        };
-                        let host = self.host.clone();
-                        if host.is_empty() {
-                            return Err(VncError::Protocol(
-                                "Host not set for TLS upgrade".to_string(),
-                            ));
-                        }
-                        let tls = TlsStream::from_tcp(tcp, &host)?;
-                        self.stream = Some(VncStream {
-                            inner: VncStreamInner::Tls(Box::new(tls)),
-                            bytes_read,
-                            bytes_written,
-                        });
-                        // TLS upgrade complete — read security result
+                        self.upgrade_to_tls()?;
                         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                         let mut buf = [0u8; 4];
                         stream.read_exact(&mut buf)?;
@@ -597,50 +622,9 @@ impl VncClient {
                         }
                     }
                     vencrypt::VencryptResult::X509 => {
-                        // X509: TLS + X509 certificate verification
-                        // Simplified: same as TLS for now (server cert verified by webpki roots)
-                        let (tcp, bytes_read, bytes_written) = match self.stream.take() {
-                            Some(VncStream {
-                                inner: VncStreamInner::Plain(tcp),
-                                bytes_read,
-                                bytes_written,
-                            }) => (tcp, bytes_read, bytes_written),
-                            Some(VncStream {
-                                inner: VncStreamInner::Tls(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol("Already TLS".to_string()));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Aes(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Cannot upgrade AES stream to X509 TLS".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Ws(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "WebSocket not supported for VeNCrypt auth".to_string(),
-                                ));
-                            }
-                            None => return Err(VncError::NotConnected),
-                        };
-                        let host = self.host.clone();
-                        if host.is_empty() {
-                            return Err(VncError::Protocol(
-                                "Host not set for X509 TLS upgrade".to_string(),
-                            ));
-                        }
-                        let tls = TlsStream::from_tcp(tcp, &host)?;
-                        self.stream = Some(VncStream {
-                            inner: VncStreamInner::Tls(Box::new(tls)),
-                            bytes_read,
-                            bytes_written,
-                        });
+                        // X509: TLS + X509 certificate verification.
+                        // Server cert is verified by webpki-roots via rustls.
+                        self.upgrade_to_tls()?;
                         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                         let mut buf = [0u8; 4];
                         stream.read_exact(&mut buf)?;
@@ -688,7 +672,7 @@ impl VncClient {
                         let key = rsa_auth.authenticate(&mut tcp)?;
                         let aes = rsa_aes::AesCfbStream::new(tcp, &key)?;
                         self.stream = Some(VncStream {
-                            inner: VncStreamInner::Aes(aes),
+                            inner: VncStreamInner::Aes(Box::new(aes)),
                             bytes_read,
                             bytes_written,
                         });
@@ -730,54 +714,19 @@ impl VncClient {
                         let key = rsa_auth.authenticate(&mut tcp)?;
                         let aes = rsa_aes::AesCfbStream::new(tcp, &key)?;
                         self.stream = Some(VncStream {
-                            inner: VncStreamInner::Aes(aes),
+                            inner: VncStreamInner::Aes(Box::new(aes)),
                             bytes_read,
                             bytes_written,
                         });
                     }
                     vencrypt::VencryptResult::AppleDh => {
-                        let (mut tcp, bytes_read, bytes_written) = match self.stream.take() {
-                            Some(VncStream {
-                                inner: VncStreamInner::Plain(tcp),
-                                bytes_read,
-                                bytes_written,
-                            }) => (tcp, bytes_read, bytes_written),
-                            Some(VncStream {
-                                inner: VncStreamInner::Tls(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Apple DH over TLS not supported".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Aes(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Already AES encrypted".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Ws(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "WebSocket not supported for Apple DH".to_string(),
-                                ));
-                            }
-                            None => return Err(VncError::NotConnected),
-                        };
-                        let dh_auth = apple_dh::AppleDhAuth;
-                        let key = dh_auth.authenticate(&mut tcp)?;
-                        // Truncate to 16 bytes for AES-128
-                        let aes_key = &key[..16.min(key.len())];
-                        let aes = rsa_aes::AesCfbStream::new(tcp, aes_key)?;
-                        self.stream = Some(VncStream {
-                            inner: VncStreamInner::Aes(aes),
-                            bytes_read,
-                            bytes_written,
-                        });
+                        // VeNCrypt Apple DH sub-type 30 is distinct from macOS Screen
+                        // Sharing's direct security type 30. The direct type 30 flow is
+                        // handled above (match arm `30 =>`); this VeNCrypt sub-type
+                        // path is not yet implemented.
+                        return Err(VncError::AuthFailed(
+                            "VeNCrypt Apple DH sub-type not yet implemented".to_string(),
+                        ));
                     }
                     vencrypt::VencryptResult::Sasl => {
                         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
@@ -807,11 +756,22 @@ impl VncClient {
         let name = {
             let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
             // Send ClientInit (shared flag = true)
-            stream.write_all(&[1u8])?;
+            log::debug!(
+                "Sending ClientInit (shared = 0x{:02x})",
+                self.client_init_shared
+            );
+            stream.write_all(&[self.client_init_shared])?;
             // Read ServerInit
             stream.read_exact(&mut buf)?;
 
             let name_len = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as usize;
+            log::debug!("ServerInit header: name_len = {}", name_len);
+            if name_len > 4096 {
+                return Err(VncError::Protocol(format!(
+                    "ServerInit name length too large: {}",
+                    name_len
+                )));
+            }
             let mut name_buf = vec![0u8; name_len];
             stream.read_exact(&mut name_buf)?;
             String::from_utf8_lossy(&name_buf).to_string()
@@ -821,6 +781,13 @@ impl VncClient {
         self.height = u16::from_be_bytes([buf[2], buf[3]]);
         self.pixel_format = PixelFormat::from_bytes(&buf[4..20])?;
         self.name = name;
+
+        log::debug!(
+            "ServerInit: {}x{} name = {:?}",
+            self.width,
+            self.height,
+            self.name
+        );
 
         self.framebuffer
             .resize(self.width as usize, self.height as usize);
@@ -842,6 +809,7 @@ impl VncClient {
         msg[0] = 0; // SetPixelFormat
                     // msg[1..4] padding (already zero)
         format.write_to(&mut msg[4..20]);
+        log::debug!("Sending SetPixelFormat: {:?}", format);
         stream.write_all(&msg)?;
         self.pixel_format = format;
         Ok(())
@@ -870,6 +838,7 @@ impl VncClient {
         for enc in encodings {
             msg.extend_from_slice(&enc.as_i32().to_be_bytes());
         }
+        log::debug!("Sending SetEncodings with {} encodings", encodings.len());
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -968,6 +937,14 @@ impl VncClient {
         msg[4..6].copy_from_slice(&y.to_be_bytes());
         msg[6..8].copy_from_slice(&width.to_be_bytes());
         msg[8..10].copy_from_slice(&height.to_be_bytes());
+        log::debug!(
+            "Sending EnableContinuousUpdates enable={} {}x{}@({},{})",
+            enable,
+            width,
+            height,
+            x,
+            y
+        );
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1053,60 +1030,76 @@ impl VncClient {
         }
 
         let mut events = Vec::new();
+
+        // Use a short timeout while waiting for the next message type so the
+        // caller can periodically check for input events and heartbeats.
+        let saved_timeout = self.read_timeout;
+        self.set_read_timeout(Some(Duration::from_millis(50)))?;
+
         let mut msg_type = [0u8; 1];
-        match self
+        let msg_type_result = self
             .stream
             .as_mut()
             .ok_or(VncError::NotConnected)?
-            .read_exact(&mut msg_type)
-        {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            .read_exact(&mut msg_type);
+
+        if let Err(e) = msg_type_result {
+            let _ = self.set_read_timeout(saved_timeout);
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 return Err(VncError::ServerClosed);
             }
-            Err(e) => return Err(e.into()),
+            return Err(e.into());
         }
 
-        match msg_type[0] {
+        // Once we know a message is arriving, use a longer timeout while reading
+        // the payload. Large frame updates (e.g. ZRLE, Raw, Tight) can take many
+        // read calls; a short per-read timeout causes partial reads and stream
+        // desynchronisation.
+        self.set_read_timeout(Some(Duration::from_secs(60)))?;
+
+        let payload_result = match msg_type[0] {
             0 => {
                 log::debug!("Server message: FramebufferUpdate");
                 self.last_msg_type = Some(0);
-                self.handle_framebuffer_update(&mut events)?;
+                self.handle_framebuffer_update(&mut events)
             }
             2 => {
                 log::debug!("Server message: Bell");
                 self.last_msg_type = Some(2);
                 events.push(VncEvent::Bell);
+                Ok(())
             }
             3 => {
                 log::debug!("Server message: ServerCutText");
                 self.last_msg_type = Some(3);
-                self.handle_server_cut_text(&mut events)?;
+                self.handle_server_cut_text(&mut events)
             }
             4 => {
                 log::debug!("Server message: EndOfContinuousUpdates (legacy type 4)");
                 self.last_msg_type = Some(4);
                 events.push(VncEvent::EndOfContinuousUpdates);
+                Ok(())
             }
             5 => {
                 log::debug!("Server message: ServerFence (legacy type 5)");
                 self.last_msg_type = Some(5);
-                self.handle_server_fence(&mut events)?;
+                self.handle_server_fence(&mut events)
             }
             150 => {
                 log::debug!("Server message: EndOfContinuousUpdates");
                 self.last_msg_type = Some(150);
                 events.push(VncEvent::EndOfContinuousUpdates);
+                Ok(())
             }
             248 => {
                 log::debug!("Server message: ServerFence");
                 self.last_msg_type = Some(248);
-                self.handle_server_fence(&mut events)?;
+                self.handle_server_fence(&mut events)
             }
             255 => {
                 log::debug!("Server message: QEMU extension");
                 self.last_msg_type = Some(255);
-                self.handle_qemu_extension(&mut events)?;
+                self.handle_qemu_extension(&mut events)
             }
             _ => {
                 let bytes_read = self.stream.as_ref().map(|s| s.bytes_read()).unwrap_or(0);
@@ -1119,15 +1112,19 @@ impl VncClient {
                     self.pixel_format,
                     bytes_read
                 );
-                return Err(VncError::Protocol(format!(
+                Err(VncError::Protocol(format!(
                     "Unknown server message type: {} (last_msg_type={:?}, last_encoding={:?}, recent_encodings={:?})",
                     msg_type[0],
                     self.last_msg_type,
                     self.last_encoding,
                     self.recent_encodings
-                )));
+                )))
             }
-        }
+        };
+
+        // Restore the caller's preferred timeout for the next message-type wait.
+        let _ = self.set_read_timeout(saved_timeout);
+        payload_result?;
 
         Ok(events)
     }
@@ -1139,10 +1136,8 @@ impl VncClient {
             stream.read_exact(&mut buf)?;
             u16::from_be_bytes([buf[1], buf[2]])
         };
-        log::debug!("Framebuffer update: {} rectangles", num_rects);
         self.recent_encodings.clear();
         self.recent_encodings.reserve(num_rects as usize);
-        let bytes_before = self.stream.as_ref().map(|s| s.bytes_read()).unwrap_or(0);
 
         for _ in 0..num_rects {
             let mut rect_header = [0u8; 12];
@@ -1159,14 +1154,6 @@ impl VncClient {
                     rect_header[10],
                     rect_header[11],
                 ]);
-                log::debug!(
-                    "Framebuffer update rectangle: {}x{}@({}, {}) encoding={}",
-                    width,
-                    height,
-                    x,
-                    y,
-                    encoding
-                );
                 self.last_encoding = Some(encoding);
                 self.recent_encodings.push(encoding);
                 (x, y, width, height, encoding)
@@ -1177,7 +1164,8 @@ impl VncClient {
                 1 => self.handle_copyrect_encoding(x, y, width, height)?,
                 2 => self.handle_rre_encoding(x, y, width, height)?,
                 5 => self.handle_hextile_encoding(x, y, width, height)?,
-                6 => self.handle_tight_encoding(x, y, width, height)?,
+                6 => self.handle_zlib_encoding(x, y, width, height)?,
+                7 => self.handle_tight_encoding(x, y, width, height)?,
                 15 => self.handle_trle_encoding(x, y, width, height)?,
                 16 => self.handle_zrle_encoding(x, y, width, height)?,
                 50 => self.handle_openh264_encoding(x, y, width, height)?,
@@ -1213,13 +1201,6 @@ impl VncClient {
                 height,
             });
         }
-
-        let bytes_after = self.stream.as_ref().map(|s| s.bytes_read()).unwrap_or(0);
-        log::debug!(
-            "Framebuffer update completed: {} rectangles, consumed {} bytes",
-            num_rects,
-            bytes_after - bytes_before
-        );
 
         let most_common = stats::most_common_encoding(&self.recent_encodings);
         self.stats_tracker.record_frame(most_common);
@@ -1382,6 +1363,28 @@ impl VncClient {
         zrle::decode(
             stream,
             &mut self.zrle_decompress,
+            &mut self.framebuffer,
+            x as usize,
+            y as usize,
+            width as usize,
+            height as usize,
+            &pixel_format,
+        )?;
+        Ok(())
+    }
+
+    fn handle_zlib_encoding(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<(), VncError> {
+        let pixel_format = self.pixel_format;
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        zlib::decode(
+            stream,
+            &mut self.zlib_decompress,
             &mut self.framebuffer,
             x as usize,
             y as usize,
@@ -1612,7 +1615,7 @@ impl VncClient {
         } else {
             // Extended Clipboard format: abs(length) bytes of extended data
             // follow the header. The first 4 bytes of that data are flags.
-            let len = len.abs() as usize;
+            let len = len.unsigned_abs() as usize;
             let mut data = vec![0u8; len];
             stream.read_exact(&mut data)?;
             let message = clipboard::decode_message(&data)?;

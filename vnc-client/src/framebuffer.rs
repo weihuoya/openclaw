@@ -1,6 +1,7 @@
 /// Framebuffer transformation for rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Transform {
+    #[default]
     None,
     Rotate90,
     Rotate180,
@@ -46,12 +47,6 @@ impl Transform {
         } else {
             height
         }
-    }
-}
-
-impl Default for Transform {
-    fn default() -> Self {
-        Self::None
     }
 }
 

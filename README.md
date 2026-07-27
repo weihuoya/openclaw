@@ -20,7 +20,7 @@ Pure Rust VNC client library implementing the RFB protocol.
 
 - [x] TCP and TLS connection management
 - [x] RFB protocol handshake (version 3.3, 3.7, 3.8)
-- [x] Authentication: None, VNC password (DES challenge-response)
+- [x] Authentication: None, VNC password (DES challenge-response), Apple Remote Desktop (Diffie-Hellman + AES-128-ECB)
 - [x] Framebuffer encodings: Raw, CopyRect, RRE, TRLE, Hextile, ZRLE, Tight
 - [x] Input events: pointer and keyboard
 - [x] Clipboard: legacy cut text and extended-clipboard provide/request
@@ -110,7 +110,7 @@ Desktop VNC client using **libadwaita** / GTK4 and GSettings.
 
 - [x] Adwaita-style GTK4 UI (header bar, toast overlay, preferences dialog)
 - [x] Reuses `VncDisplay` from `vnc-widget-gtk4` for remote framebuffer rendering
-- [x] Supports **no authentication** and **VNC password authentication**
+- [x] Supports **no authentication**, **VNC password authentication**, and **Apple Remote Desktop authentication**
 - [x] Settings persisted to GSettings:
   - host, port, username, auth method
   - preferred encoding, view-only, scale-to-fit

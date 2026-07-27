@@ -35,28 +35,12 @@ pub fn decode<R: Read>(
     let mut compressed = vec![0u8; compressed_len];
     stream.read_exact(&mut compressed)?;
 
-    log::debug!(
-        "ZRLE decode rect={}x{}@({}, {}) bpp={} compressed_len={} expected_uncompressed={}",
-        rect_w,
-        rect_h,
-        rect_x,
-        rect_y,
-        bpp,
-        compressed_len,
-        rect_w * rect_h * bpp
-    );
-
     // Some servers (e.g. wayvnc) use a single zlib stream for all ZRLE
     // rectangles; others start a new zlib stream per rectangle. Reset the
     // decompressor whenever we see a fresh zlib header.
     if is_zlib_header(&compressed) {
         log::debug!("ZRLE detected fresh zlib header, resetting decompressor");
         *decompress = Some(Decompress::new(true));
-    } else {
-        log::debug!(
-            "ZRLE no zlib header (first bytes: {:02x?}); continuing with existing decompressor",
-            &compressed[..compressed.len().min(4)]
-        );
     }
 
     let decompressor = decompress
@@ -64,17 +48,10 @@ pub fn decode<R: Read>(
         .ok_or_else(|| VncError::Protocol("ZRLE decompressor not initialized".to_string()))?;
 
     let data = decompress_chunk(&compressed, decompressor, rect_w * rect_h * bpp)?;
-
     let mut cursor = Cursor::new(&data);
 
     let tiles_x = rect_w.div_ceil(TILE_WIDTH);
     let tiles_y = rect_h.div_ceil(TILE_HEIGHT);
-    log::debug!(
-        "ZRLE decompressed {} bytes, tiles={}x{}",
-        data.len(),
-        tiles_x,
-        tiles_y
-    );
 
     for ty in 0..tiles_y {
         for tx in 0..tiles_x {
@@ -82,8 +59,6 @@ pub fn decode<R: Read>(
             let y = rect_y + ty * TILE_HEIGHT;
             let w = TILE_WIDTH.min(rect_w - tx * TILE_WIDTH);
             let h = TILE_HEIGHT.min(rect_h - ty * TILE_HEIGHT);
-            log::debug!("ZRLE tile@({}, {}) size={}x{}", x, y, w, h);
-
             decode_tile(&mut cursor, fb, x, y, w, h, pixel_format, bpp)?;
         }
     }
@@ -100,12 +75,6 @@ pub fn decode<R: Read>(
             remaining
         );
     }
-    log::debug!(
-        "ZRLE decode done: consumed {} of {} decompressed bytes, remaining={}",
-        consumed,
-        data.len(),
-        remaining
-    );
 
     Ok(())
 }
@@ -129,19 +98,12 @@ fn decompress_chunk(
     decompress: &mut Decompress,
     min_output: usize,
 ) -> Result<Vec<u8>, VncError> {
-    log::debug!(
-        "ZRLE decompress_chunk: compressed_len={} min_output={}",
-        compressed.len(),
-        min_output
-    );
-
     let mut output = Vec::with_capacity(min_output.max(compressed.len() * 4));
     let mut input_offset = 0;
     let mut iteration = 0;
 
     loop {
         iteration += 1;
-        let output_len_before = output.len();
 
         // Ensure we have spare capacity for the next pass.
         let spare = output.capacity() - output.len();
@@ -150,15 +112,6 @@ fn decompress_chunk(
         }
 
         let total_in_before = decompress.total_in();
-        log::debug!(
-            "ZRLE decompress iter={}: input_offset={} remaining={} output_len={} spare={}",
-            iteration,
-            input_offset,
-            compressed.len() - input_offset,
-            output_len_before,
-            output.capacity() - output_len_before
-        );
-
         let status = decompress
             .decompress_vec(
                 &compressed[input_offset..],
@@ -168,17 +121,6 @@ fn decompress_chunk(
             .map_err(|e| VncError::Protocol(format!("ZRLE decompress error: {}", e)))?;
         let consumed = (decompress.total_in() - total_in_before) as usize;
         input_offset += consumed;
-
-        log::debug!(
-            "ZRLE decompress iter={} result: consumed={} total_in={} status={:?} output_len={} -> {}",
-            iteration,
-            consumed,
-            input_offset,
-            status,
-            output_len_before,
-            output.len()
-        );
-
         if input_offset == compressed.len() {
             // Some zlib data may still be buffered inside the decompressor after
             // the last input chunk has been consumed. Keep flushing with empty input
@@ -202,12 +144,6 @@ fn decompress_chunk(
 
         if consumed == 0 && status == Status::Ok {
             // More output space is needed.
-            if output.len() == output_len_before {
-                log::debug!(
-                    "ZRLE decompress iter={}: no progress (no input consumed, no output produced); retrying with more output space",
-                    iteration
-                );
-            }
             continue;
         }
 
@@ -252,17 +188,6 @@ fn decode_tile<R: Read>(
 ) -> Result<(), VncError> {
     let mut subencoding = [0u8; 1];
     cursor.read_exact(&mut subencoding)?;
-    log::debug!(
-        "ZRLE tile@({}, {}) subencoding={} (palette_size={})",
-        x,
-        y,
-        subencoding[0],
-        if subencoding[0] >= 128 {
-            subencoding[0] - 128
-        } else {
-            subencoding[0]
-        }
-    );
 
     match subencoding[0] {
         0 => decode_raw_tile(cursor, fb, x, y, w, h, pixel_format, bpp),

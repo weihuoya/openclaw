@@ -19,6 +19,8 @@ webpki-roots = "0.26"
 rsa = "0.9"
 aes = "0.8"
 ctr = "0.9"
+md5 = "0.7"
+num-bigint = { version = "0.4", features = ["rand"] }
 rand = "0.8"
 sha2 = "0.10"
 sasl = { version = "0.5.2", features = ["scram"] }

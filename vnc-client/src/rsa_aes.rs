@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use aes::Aes128;
-use ctr::cipher::KeyIvInit;
+use aes::{Aes128, Aes256};
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rsa::{pkcs8::DecodePublicKey, Oaep, RsaPublicKey};
@@ -18,7 +18,7 @@ use crate::VncError;
 /// 3. Client encrypts AES key with RSA-OAEP (SHA-256)
 /// 4. Client sends encrypted key (length-prefixed)
 /// 5. Server sends security result (4 bytes)
-/// 6. All subsequent traffic encrypted with AES-CFB
+/// 6. All subsequent traffic encrypted with AES-CTR (TigerVNC/noVNC use CTR, not CFB)
 pub struct RsaAesAuth {
     key_size: usize,
 }
@@ -79,31 +79,67 @@ impl RsaAesAuth {
     }
 }
 
-/// AES-128-CFB encrypt/decrypt helper.
-#[derive(Clone)]
-pub struct AesCfb {
-    cipher: ctr::Ctr128BE<Aes128>,
+/// AES-CTR cipher that supports both AES-128 and AES-256.
+enum AesCtr {
+    Aes128(Box<ctr::Ctr128BE<Aes128>>),
+    Aes256(Box<ctr::Ctr128BE<Aes256>>),
+}
+
+impl AesCtr {
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, VncError> {
+        match key.len() {
+            16 => {
+                let cipher = ctr::Ctr128BE::<Aes128>::new_from_slices(key, iv).map_err(|_| {
+                    VncError::Protocol("Failed to create AES-128 cipher".to_string())
+                })?;
+                Ok(Self::Aes128(Box::new(cipher)))
+            }
+            32 => {
+                let cipher = ctr::Ctr128BE::<Aes256>::new_from_slices(key, iv).map_err(|_| {
+                    VncError::Protocol("Failed to create AES-256 cipher".to_string())
+                })?;
+                Ok(Self::Aes256(Box::new(cipher)))
+            }
+            _ => Err(VncError::Protocol(
+                "AES key must be 16 (AES-128) or 32 (AES-256) bytes".to_string(),
+            )),
+        }
+    }
+
+    fn apply(&mut self, data: &mut [u8]) {
+        match self {
+            Self::Aes128(c) => c.apply_keystream(data),
+            Self::Aes256(c) => c.apply_keystream(data),
+        }
+    }
 }
 
 /// AES-CTR encrypted stream wrapper.
 ///
-/// Wraps a TCP stream and applies AES-128-CTR encryption/decryption
+/// Wraps a TCP stream and applies AES-CTR encryption/decryption
 /// to all read/write operations. Separate cipher states for each direction.
+///
+/// Writes are buffered until `flush()` is called to ensure atomicity:
+/// if a write fails mid-stream the cipher counter is not advanced,
+/// so the next retry starts from the same counter value.
 pub struct AesCfbStream {
     inner: TcpStream,
-    read_cipher: AesCfb,
-    write_cipher: AesCfb,
+    read_cipher: AesCtr,
+    write_cipher: AesCtr,
+    /// Buffered plaintext waiting to be encrypted and sent.
+    write_buffer: Vec<u8>,
 }
 
 impl AesCfbStream {
     pub fn new(inner: TcpStream, key: &[u8]) -> Result<Self, VncError> {
         let iv = vec![0u8; 16];
-        let read_cipher = AesCfb::new(key, &iv)?;
-        let write_cipher = AesCfb::new(key, &iv)?;
+        let read_cipher = AesCtr::new(key, &iv)?;
+        let write_cipher = AesCtr::new(key, &iv)?;
         Ok(Self {
             inner,
             read_cipher,
             write_cipher,
+            write_buffer: Vec::new(),
         })
     }
 
@@ -128,36 +164,19 @@ impl Read for AesCfbStream {
 
 impl Write for AesCfbStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Encrypt the entire buffer into a temporary vec.
-        // We must write all encrypted bytes or none, because a partial
-        // write would advance the CTR state without the corresponding
-        // bytes reaching the peer, desynchronising the stream.
-        let mut encrypted = buf.to_vec();
-        self.write_cipher.apply(&mut encrypted);
-        self.inner.write_all(&encrypted)?;
+        // Buffer plaintext; encryption is deferred to flush() so that
+        // partial TCP writes cannot leave the CTR counter out of sync.
+        self.write_buffer.extend_from_slice(buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-impl AesCfb {
-    pub fn new(key: &[u8], iv: &[u8]) -> Result<Self, VncError> {
-        if key.len() != 16 || iv.len() != 16 {
-            return Err(VncError::Protocol(
-                "AES-128 requires 16-byte key and IV".to_string(),
-            ));
+        if !self.write_buffer.is_empty() {
+            let mut encrypted = std::mem::take(&mut self.write_buffer);
+            self.write_cipher.apply(&mut encrypted);
+            self.inner.write_all(&encrypted)?;
         }
-        let cipher = ctr::Ctr128BE::<Aes128>::new_from_slices(key, iv)
-            .map_err(|_| VncError::Protocol("Failed to create AES cipher".to_string()))?;
-        Ok(Self { cipher })
-    }
-
-    pub fn apply(&mut self, data: &mut [u8]) {
-        use ctr::cipher::StreamCipher;
-        self.cipher.apply_keystream(data);
+        self.inner.flush()
     }
 }
 

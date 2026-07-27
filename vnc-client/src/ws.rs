@@ -19,10 +19,10 @@ pub struct WsStream {
 impl WsStream {
     pub fn connect(url: &str) -> Result<Self, VncError> {
         let (ws, _) = tungstenite::connect(url).map_err(|e| {
-            VncError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("WebSocket handshake failed: {}", e),
-            ))
+            VncError::Io(std::io::Error::other(format!(
+                "WebSocket handshake failed: {}",
+                e
+            )))
         })?;
 
         Ok(Self {
@@ -60,10 +60,7 @@ impl WsStream {
                 }
                 Err(WsError::Io(e)) => return Err(e),
                 Err(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("WebSocket error: {}", e),
-                    ));
+                    return Err(std::io::Error::other(format!("WebSocket error: {}", e)));
                 }
             }
         }
@@ -108,19 +105,11 @@ impl Write for WsStream {
         if !self.write_buf.is_empty() {
             self.ws
                 .write(tungstenite::Message::Binary(self.write_buf.clone()))
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("WebSocket write error: {}", e),
-                    )
-                })?;
+                .map_err(|e| std::io::Error::other(format!("WebSocket write error: {}", e)))?;
             self.write_buf.clear();
         }
-        self.ws.flush().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("WebSocket flush error: {}", e),
-            )
-        })
+        self.ws
+            .flush()
+            .map_err(|e| std::io::Error::other(format!("WebSocket flush error: {}", e)))
     }
 }

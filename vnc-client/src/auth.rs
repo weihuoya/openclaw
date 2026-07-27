@@ -40,12 +40,51 @@ impl AuthHandler for NoAuthHandler {
         if types.contains(&1) {
             Ok(1) // None
         } else {
-            Err(VncError::AuthFailed("No supported auth types".to_string()))
+            Err(VncError::AuthFailed(format!(
+                "No supported auth types (server offered {:?})",
+                types
+            )))
         }
     }
 
     fn authenticate_vnc(&mut self, _stream: &mut dyn Stream) -> Result<(), VncError> {
         Err(VncError::AuthFailed("VNC auth not supported".to_string()))
+    }
+}
+
+/// Apple Remote Desktop authentication handler (RFB security type 30).
+pub struct AppleDhAuthHandler {
+    username: String,
+    password: String,
+}
+
+impl AppleDhAuthHandler {
+    pub fn new(username: String, password: String) -> Self {
+        Self { username, password }
+    }
+}
+
+impl AuthHandler for AppleDhAuthHandler {
+    fn select_security_type(&mut self, types: &[u8]) -> Result<u8, VncError> {
+        if types.contains(&30) {
+            Ok(30)
+        } else {
+            Err(VncError::AuthFailed(format!(
+                "No supported auth types (server offered {:?})",
+                types
+            )))
+        }
+    }
+
+    fn authenticate_vnc(&mut self, _stream: &mut dyn Stream) -> Result<(), VncError> {
+        Err(VncError::AuthFailed(
+            "Apple DH auth does not use VNC challenge-response".to_string(),
+        ))
+    }
+
+    fn authenticate(&mut self, stream: &mut dyn Stream, _type: u8) -> Result<(), VncError> {
+        crate::apple_dh::AppleDhAuth::new(self.username.clone(), self.password.clone())
+            .authenticate(stream)
     }
 }
 
@@ -67,7 +106,10 @@ impl AuthHandler for PasswordAuthHandler {
         } else if types.contains(&1) {
             Ok(1) // None
         } else {
-            Err(VncError::AuthFailed("No supported auth types".to_string()))
+            Err(VncError::AuthFailed(format!(
+                "No supported auth types (server offered {:?})",
+                types
+            )))
         }
     }
 
