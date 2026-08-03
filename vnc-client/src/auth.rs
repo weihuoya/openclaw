@@ -20,6 +20,11 @@ pub trait AuthHandler {
             _type
         )))
     }
+
+    /// Optional post-authentication key material (e.g., Apple HP wrap key).
+    fn session_key(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Trait alias for stream types used in authentication.
@@ -56,11 +61,16 @@ impl AuthHandler for NoAuthHandler {
 pub struct AppleDhAuthHandler {
     username: String,
     password: String,
+    session_key: Option<Vec<u8>>,
 }
 
 impl AppleDhAuthHandler {
     pub fn new(username: String, password: String) -> Self {
-        Self { username, password }
+        Self {
+            username,
+            password,
+            session_key: None,
+        }
     }
 }
 
@@ -83,8 +93,64 @@ impl AuthHandler for AppleDhAuthHandler {
     }
 
     fn authenticate(&mut self, stream: &mut dyn Stream, _type: u8) -> Result<(), VncError> {
-        crate::apple_dh::AppleDhAuth::new(self.username.clone(), self.password.clone())
-            .authenticate(stream)
+        let key = crate::apple_dh::AppleDhAuth::new(self.username.clone(), self.password.clone())
+            .authenticate(stream)?;
+        self.session_key = Some(key.to_vec());
+        Ok(())
+    }
+
+    fn session_key(&mut self) -> Option<Vec<u8>> {
+        self.session_key.take()
+    }
+}
+
+/// Apple Screen Sharing authentication handler (RFB security type 33 RSA-SRP).
+pub struct AppleSrpAuthHandler {
+    username: String,
+    password: String,
+    session_key: Option<Vec<u8>>,
+}
+
+impl AppleSrpAuthHandler {
+    pub fn new(username: String, password: String) -> Self {
+        Self {
+            username,
+            password,
+            session_key: None,
+        }
+    }
+}
+
+impl AuthHandler for AppleSrpAuthHandler {
+    fn select_security_type(&mut self, types: &[u8]) -> Result<u8, VncError> {
+        // Prefer type 33 (RSA-SRP) over type 30 (DH) when both are offered.
+        if types.contains(&33) {
+            Ok(33)
+        } else if types.contains(&30) {
+            Ok(30)
+        } else {
+            Err(VncError::AuthFailed(format!(
+                "No supported auth types (server offered {:?})",
+                types
+            )))
+        }
+    }
+
+    fn authenticate_vnc(&mut self, _stream: &mut dyn Stream) -> Result<(), VncError> {
+        Err(VncError::AuthFailed(
+            "Apple SRP auth does not use VNC challenge-response".to_string(),
+        ))
+    }
+
+    fn authenticate(&mut self, stream: &mut dyn Stream, _type: u8) -> Result<(), VncError> {
+        let key = crate::apple_srp::AppleSrpAuth::new(self.username.clone(), self.password.clone())
+            .authenticate(stream)?;
+        self.session_key = Some(key);
+        Ok(())
+    }
+
+    fn session_key(&mut self) -> Option<Vec<u8>> {
+        self.session_key.take()
     }
 }
 

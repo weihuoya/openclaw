@@ -48,6 +48,8 @@ openclaw/
 ├── vnc-client/
 │   ├── Cargo.toml
 │   ├── WAYVNC_COMPAT.md        # wayvnc/neatvnc feature matrix
+│   ├── APPLE_HP.md             # Apple High-Performance VNC protocol notes
+│   ├── reference/              # External reference materials (Apple HP spec + iShareScreen client)
 │   ├── examples/vnc_viewer.rs
 │   └── src/
 │       ├── lib.rs              # VncClient, VncClientBuilder, VncStream, VncEvent
@@ -68,6 +70,8 @@ openclaw/
 │       ├── ws.rs                # WebSocket stream wrapper
 │       ├── zrle.rs              # ZRLE decoder
 │       ├── apple_dh.rs          # Apple Diffie-Hellman auth
+│       ├── apple_srp.rs         # Apple HP SRP auth
+│       ├── apple_record_layer.rs # Apple HP encrypted record layer
 │       └── decoder/
 │           ├── mod.rs           # VideoDecoder trait + DefaultDecoder alias
 │           ├── gstreamer.rs     # Linux GStreamer H.264 decoder
@@ -203,6 +207,9 @@ and Android crates are mostly integration code without standalone unit tests.
 
 - `VncClient` in `src/lib.rs` is the main state machine. It manages a
   `VncStream`, handshake state, framebuffer, encodings, and H.264 decoder.
+  When Apple High-Performance mode is negotiated, the stream is wrapped in
+  `AppleRecordLayer` from `apple_record_layer.rs` for message framing and
+  per-record AES-GCM encryption.
 - `VncStream` wraps `TcpStream`, `TlsStream`, `AesCfbStream`, and
   `WsStream` behind a common `Read + Write` interface and tracks bytes read
   and written for transfer-speed statistics.
@@ -374,12 +381,14 @@ and Android crates are mostly integration code without standalone unit tests.
 ### Update the RFB protocol version or security type
 
 - Modify `vnc-client/src/protocol.rs` for constants.
-- Modify `VncClient::handshake_version` or `auth.rs` / `vencrypt.rs` for
-  security handling.
-- Update `README.md` and `WAYVNC_COMPAT.md` if behavior changes.
+- Modify `VncClient::handshake_version` or `auth.rs` / `vencrypt.rs` / `apple_srp.rs`
+  for security handling.
+- Update `README.md` and `WAYVNC_COMPAT.md` (and `APPLE_HP.md` for Apple HP changes)
+  if behavior changes.
 
 ## References
 
 - `README.md` — user-facing overview, feature checklist, and roadmap.
 - `vnc-client/WAYVNC_COMPAT.md` — wayvnc/neatvnc compatibility matrix.
+- `vnc-client/APPLE_HP.md` — Apple High-Performance VNC protocol notes.
 - RFB protocol reference: https://vncdotool.readthedocs.io/en/0.8.0/rfbproto.html

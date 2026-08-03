@@ -20,6 +20,8 @@ pub enum Encoding {
     CursorPos,
     /// OpenH264 encoding
     OpenH264,
+    /// Apple high-performance encoding with a raw wire value.
+    AppleHp(i32),
     /// Fence pseudo-encoding
     Fence,
     /// ContinuousUpdates pseudo-encoding
@@ -46,6 +48,7 @@ impl Encoding {
             Encoding::Cursor => -239,
             Encoding::CursorPos => -240,
             Encoding::OpenH264 => 50,
+            Encoding::AppleHp(value) => value,
             Encoding::Fence => -312,
             Encoding::ContinuousUpdates => -313,
             Encoding::ExtendedClipboard => -1063131698,
@@ -74,6 +77,17 @@ pub fn encoding_name(value: i32) -> &'static str {
         -313 => "ContinuousUpdates",
         -308 => "ExtendedDesktopSize",
         -1063131698 => "ExtendedClipboard",
+        _ if value >= 0x3e8
+            || value == 1100
+            || value == 1101
+            || value == 1104
+            || value == 1105
+            || value == 1107
+            || value == 1109
+            || value == 1110 =>
+        {
+            "AppleHp"
+        }
         _ => "Unknown",
     }
 }
@@ -101,6 +115,6 @@ pub fn from_i32(value: i32) -> Option<Encoding> {
         -313 => Some(Encoding::ContinuousUpdates),
         -308 => Some(Encoding::ExtendedDesktopSize),
         -1063131698 => Some(Encoding::ExtendedClipboard),
-        _ => None,
+        _ => Some(Encoding::AppleHp(value)),
     }
 }

@@ -10,6 +10,7 @@ use vnc_client::encodings::Encoding;
 use gettextrs::{bindtextdomain, gettext, setlocale, textdomain, LocaleCategory};
 
 use std::process;
+use std::rc::Rc;
 
 const APP_ID: &str = "com.weiz.vnc-client-adwaita";
 const SCHEMA_ID: &str = "com.weiz.vnc-client-adwaita";
@@ -187,8 +188,10 @@ fn build_ui(app: &adw::Application) {
 
     // (Preferences were moved into the Connect dialog.)
 
-    // Error callback
-    vnc_display.set_error_callback(Box::new(clone!(
+    // Error callback: route runtime errors to the main window toast overlay.
+    // While the connect dialog is open, this callback is temporarily replaced
+    // by one that targets the dialog's own overlay so errors are visible.
+    let main_error_cb: Rc<dyn Fn(String)> = Rc::new(clone!(
         #[weak]
         toast_overlay,
         #[weak]
@@ -199,7 +202,11 @@ fn build_ui(app: &adw::Application) {
             connect_btn.set_sensitive(true);
             connect_btn.set_label(&gettext("Connect"));
         }
-    )));
+    ));
+    vnc_display.set_error_callback(Box::new({
+        let cb = main_error_cb.clone();
+        move |msg| cb(msg)
+    }));
 
     // View-only
     let vnc_display_for_view_only = vnc_display.clone();
@@ -217,8 +224,6 @@ fn build_ui(app: &adw::Application) {
         #[strong]
         settings,
         #[weak]
-        toast_overlay,
-        #[weak]
         connect_btn,
         move |_| {
             let label = connect_btn
@@ -232,7 +237,7 @@ fn build_ui(app: &adw::Application) {
                     &window,
                     &vnc_display,
                     &settings,
-                    &toast_overlay,
+                    &main_error_cb,
                     &connect_btn,
                 );
             }
@@ -261,7 +266,7 @@ fn show_connect_dialog(
     parent: &adw::ApplicationWindow,
     vnc_display: &VncDisplay,
     settings: &gio::Settings,
-    toast_overlay: &adw::ToastOverlay,
+    main_error_cb: &Rc<dyn Fn(String)>,
     connect_btn: &gtk4::Button,
 ) {
     // Server group
@@ -374,9 +379,14 @@ fn show_connect_dialog(
     toolbar_view.set_content(Some(&preferences_page));
     toolbar_view.add_bottom_bar(&button_box);
 
+    // Put a ToastOverlay inside the dialog so validation and connection errors
+    // are visible above the dialog content rather than hidden behind the modal.
+    let dialog_toast_overlay = adw::ToastOverlay::new();
+    dialog_toast_overlay.set_child(Some(&toolbar_view));
+
     let dialog = adw::Dialog::builder()
         .title(gettext("Connect to VNC server"))
-        .child(&toolbar_view)
+        .child(&dialog_toast_overlay)
         .content_width(560)
         .content_height(640)
         .default_widget(&dialog_connect_btn)
@@ -391,7 +401,7 @@ fn show_connect_dialog(
         #[weak]
         auth_row,
         #[weak]
-        toast_overlay,
+        dialog_toast_overlay,
         #[weak]
         connect_btn,
         #[weak]
@@ -403,7 +413,7 @@ fn show_connect_dialog(
                 dialog_connect_btn.set_sensitive(true);
                 if let Some(error) = result.error {
                     log::error!("VNC handshake failed: {}", error);
-                    toast_overlay.add_toast(adw::Toast::new(&error));
+                    dialog_toast_overlay.add_toast(adw::Toast::new(&error));
                 }
                 update_auth_row_from_supported_types(
                     &auth_row,
@@ -424,6 +434,43 @@ fn show_connect_dialog(
             dialog.close();
         }
     ));
+
+    // Route async runtime errors to the dialog's own toast overlay while it is
+    // open. When the dialog closes, restore the callback that targets the main
+    // window overlay.
+    let dialog_error_cb: Rc<dyn Fn(String)> = Rc::new(clone!(
+        #[weak]
+        dialog_toast_overlay,
+        #[weak]
+        connect_btn,
+        #[weak]
+        dialog_connect_btn,
+        move |msg: String| {
+            log::error!("VNC error: {}", msg);
+            dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
+            connect_btn.set_sensitive(true);
+            connect_btn.set_label(&gettext("Connect"));
+            dialog_connect_btn.set_sensitive(true);
+        }
+    ));
+    vnc_display.set_error_callback(Box::new({
+        let cb = dialog_error_cb.clone();
+        move |msg| cb(msg)
+    }));
+
+    dialog.connect_closed(clone!(
+        #[weak]
+        vnc_display,
+        #[strong]
+        main_error_cb,
+        move |_| {
+            vnc_display.set_error_callback(Box::new({
+                let cb = main_error_cb.clone();
+                move |msg| cb(msg)
+            }));
+        }
+    ));
+
     dialog_connect_btn.connect_clicked(clone!(
         #[weak]
         host_row,
@@ -438,7 +485,7 @@ fn show_connect_dialog(
         #[strong]
         settings,
         #[weak]
-        toast_overlay,
+        dialog_toast_overlay,
         #[weak]
         dialog_connect_btn,
         move |_| {
@@ -446,7 +493,7 @@ fn show_connect_dialog(
             if host.is_empty() {
                 let msg = gettext("Host cannot be empty");
                 log::error!("{}", msg);
-                toast_overlay.add_toast(adw::Toast::new(&msg));
+                dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
                 return;
             }
             let port = port_row.value() as u16;
@@ -463,7 +510,7 @@ fn show_connect_dialog(
                     if password.is_empty() {
                         let msg = gettext("Password is required");
                         log::error!("{}", msg);
-                        toast_overlay.add_toast(adw::Toast::new(&msg));
+                        dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
                         return;
                     }
                     Box::new(PasswordAuthHandler::new(password.to_string()))
@@ -472,13 +519,13 @@ fn show_connect_dialog(
                     if username.is_empty() {
                         let msg = gettext("Username is required for Apple Remote Desktop");
                         log::error!("{}", msg);
-                        toast_overlay.add_toast(adw::Toast::new(&msg));
+                        dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
                         return;
                     }
                     if password.is_empty() {
                         let msg = gettext("Password is required for Apple Remote Desktop");
                         log::error!("{}", msg);
-                        toast_overlay.add_toast(adw::Toast::new(&msg));
+                        dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
                         return;
                     }
                     Box::new(AppleDhAuthHandler::new(
@@ -495,12 +542,10 @@ fn show_connect_dialog(
             match vnc_display.connect_with_options(&host, port, false, auth, &encodings) {
                 Ok(()) => {
                     dialog_connect_btn.set_sensitive(false);
-                    // Don't keep the password in memory longer than necessary.
-                    password_row.set_text("");
                 }
                 Err(e) => {
                     log::error!("VNC connection failed: {}", e);
-                    toast_overlay.add_toast(adw::Toast::new(&e));
+                    dialog_toast_overlay.add_toast(adw::Toast::new(&e));
                 }
             }
         }

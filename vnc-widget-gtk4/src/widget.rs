@@ -184,9 +184,12 @@ mod imp {
         fn measure(&self, orientation: gtk4::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             let width = self.width.get().max(1);
             let height = self.height.get().max(1);
+            // Minimum size is 1 so the widget can be allocated smaller than the
+            // remote framebuffer when "scale to fit" is enabled. Natural size
+            // remains the framebuffer size so 1:1 / scrolled mode still works.
             match orientation {
-                gtk4::Orientation::Horizontal => (width, width, -1, -1),
-                gtk4::Orientation::Vertical => (height, height, -1, -1),
+                gtk4::Orientation::Horizontal => (1, width, -1, -1),
+                gtk4::Orientation::Vertical => (1, height, -1, -1),
                 _ => (0, 0, -1, -1),
             }
         }
@@ -340,12 +343,23 @@ mod imp {
                 id.remove();
             }
 
+            // Clear the paintable to release the last frame texture and any GL
+            // resources, then drop it so the next snapshot paints black.
+            if let Some(paintable) = self.paintable.borrow().as_ref() {
+                paintable.clear();
+            }
             *self.paintable.borrow_mut() = None;
             self.width.set(0);
             self.height.set(0);
+            self.frame_data.lock().unwrap().clear();
+            self.cursor_data.lock().unwrap().clear();
             self.error_queue.lock().unwrap().clear();
             self.handshake_queue.lock().unwrap().clear();
             *self.stats.lock().unwrap() = ConnectionStats::default();
+
+            // Request a redraw so the widget actually shows black instead of the
+            // previously rendered framebuffer.
+            self.obj().queue_draw();
         }
     }
 }
@@ -512,6 +526,7 @@ impl VncDisplay {
             let mut last_activity = Instant::now();
             let mut last_stats_sample = Instant::now();
             let mut last_update_request = Instant::now();
+            let mut first_frame_received = false;
 
             while running_bg.load(Ordering::SeqCst) {
                 // Check for input events
@@ -543,11 +558,17 @@ impl VncDisplay {
                 }
 
                 // Poll for updates when continuous updates are not enabled.
+                // Until the first full frame has been received, request a
+                // non-incremental update so that the decoder always gets a key
+                // frame first. Some servers send a P-frame in response to an
+                // incremental request, which breaks H264 decoders that have not
+                // yet seen an IDR.
                 if !continuous_updates
                     && last_update_request.elapsed() >= Duration::from_millis(100)
                 {
                     let (w, h) = client.dimensions();
-                    let _ = client.request_update(true, 0, 0, w, h);
+                    let incremental = first_frame_received;
+                    let _ = client.request_update(incremental, 0, 0, w, h);
                     last_update_request = Instant::now();
                 }
 
@@ -558,30 +579,35 @@ impl VncDisplay {
                         let mut resized = false;
                         for event in events {
                             match event {
-                                VncEvent::FramebufferUpdate { .. } => updated = true,
+                                VncEvent::FramebufferUpdate { .. } => {
+                                    updated = true;
+                                    first_frame_received = true;
+                                }
                                 VncEvent::GeometryChanged { .. } => resized = true,
                                 VncEvent::CursorShape(shape) => {
                                     let mut queue = cursor_data.lock().unwrap();
                                     queue.push(shape);
                                 }
                                 VncEvent::EndOfContinuousUpdates => {
-                                    // Server paused continuous updates; request an
-                                    // incremental frame to resume the stream.
+                                    // Server paused continuous updates. If we have
+                                    // not yet received a full frame, request a
+                                    // non-incremental refresh to force the server to
+                                    // send a keyframe.
                                     let (w, h) = client.dimensions();
-                                    let _ = client.request_update(true, 0, 0, w, h);
+                                    let incremental = first_frame_received;
+                                    let _ = client.request_update(incremental, 0, 0, w, h);
                                 }
                                 _ => {}
                             }
                         }
 
                         // If the server is not pushing frames continuously, request
-                        // the next incremental update exactly once per message batch.
-                        // Sending one request per rectangle can overflow the server's
-                        // pending request queue and cause the peer to reset the
-                        // connection.
+                        // the next update exactly once per message batch. Use
+                        // incremental updates once the first full frame has been
+                        // received; otherwise request a full refresh.
                         if updated {
                             let (w, h) = client.dimensions();
-                            let _ = client.request_update(true, 0, 0, w, h);
+                            let _ = client.request_update(first_frame_received, 0, 0, w, h);
                         }
 
                         if updated || resized {

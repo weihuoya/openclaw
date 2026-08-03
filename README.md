@@ -21,6 +21,14 @@ Pure Rust VNC client library implementing the RFB protocol.
 - [x] TCP and TLS connection management
 - [x] RFB protocol handshake (version 3.3, 3.7, 3.8)
 - [x] Authentication: None, VNC password (DES challenge-response), Apple Remote Desktop (Diffie-Hellman + AES-128-ECB)
+- [x] Apple high-performance mode (partial):
+  - [x] RSA-SRP authentication (type 33)
+  - [x] AES-128-CBC encrypted record layer with SHA-1 integrity
+  - [x] Initial rekey and mid-session rekey
+  - [ ] Virtual display configuration (`SetDisplayConfiguration` 0x1d)
+  - [ ] Apple cursor cache/rendering (`0x450`)
+  - [ ] Apple still-image codecs (`0x3ea`, `0x3f3`)
+  - [ ] HEVC/UDP media negotiation (`0x1c`)
 - [x] Framebuffer encodings: Raw, CopyRect, RRE, TRLE, Hextile, ZRLE, Tight
 - [x] Input events: pointer and keyboard
 - [x] Clipboard: legacy cut text and extended-clipboard provide/request
@@ -177,6 +185,12 @@ Android integration scaffold for `vnc-client`.
 - [ ] Fullscreen mode and toolbar overlay
 - [x] Connection dialog and password prompt (provided by `vnc-client-adwaita`)
 - [ ] Reconnection and error handling
+
+## Apple High-Performance Mode
+
+`vnc-client` has a partial implementation of Apple's macOS Screen Sharing
+high-performance extension. See [`vnc-client/APPLE_HP.md`](vnc-client/APPLE_HP.md)
+for the protocol details and current completion checklist.
 
 ## References
 

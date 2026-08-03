@@ -1,11 +1,30 @@
-use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
-use aes::Aes128;
+use aes::cipher::{BlockEncryptMut, KeyInit};
+use ecb::Encryptor as EcbEncryptor;
 use num_bigint::{BigUint, RandBigInt};
 use rand::rngs::ThreadRng;
 use rand::RngCore;
 
 use crate::auth::Stream;
 use crate::VncError;
+
+type Aes128EcbEnc = EcbEncryptor<aes::Aes128>;
+
+/// Return a short `first..last` hex snippet of `data` for debug logging.
+fn hex_snippet(data: &[u8], head: usize, tail: usize) -> String {
+    if data.len() <= head + tail {
+        data.iter().map(|b| format!("{:02x}", b)).collect()
+    } else {
+        let mut s = String::with_capacity(head * 2 + tail * 2 + 3);
+        for b in &data[..head] {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s.push_str("...");
+        for b in &data[data.len() - tail..] {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
+    }
+}
 
 /// Apple Remote Desktop Diffie-Hellman authentication handler (RFB security type 30).
 ///
@@ -14,6 +33,7 @@ use crate::VncError;
 /// encrypted with AES-128-ECB using an MD5-derived key from the shared secret.
 ///
 /// Protocol reference:
+/// - `vnc-client/reference/apple_vnc_rfc.md` §4.2.3
 /// - <https://www.tenable.com/blog/detecting-macos-high-sierra-root-account-without-authentication>
 pub struct AppleDhAuth {
     username: String,
@@ -27,7 +47,10 @@ impl AppleDhAuth {
     }
 
     /// Perform the Apple DH authentication handshake.
-    pub fn authenticate(&self, stream: &mut dyn Stream) -> Result<(), VncError> {
+    ///
+    /// On success, returns the 16-byte wrap key (`MD5(shared_secret)[0..16]`)
+    /// used by the Apple encrypted record layer in high-performance mode.
+    pub fn authenticate(&self, stream: &mut dyn Stream) -> Result<[u8; 16], VncError> {
         let mut rng = rand::thread_rng();
 
         // Server sends: generator (2 bytes BE), key length (2 bytes BE),
@@ -57,6 +80,16 @@ impl AppleDhAuth {
             generator,
             key_length
         );
+        log::debug!(
+            "Apple DH prime modulus ({} B): {}",
+            prime_bytes.len(),
+            hex_snippet(&prime_bytes, 4, 4)
+        );
+        log::debug!(
+            "Apple DH server public ({} B): {}",
+            server_public_bytes.len(),
+            hex_snippet(&server_public_bytes, 4, 4)
+        );
 
         // Generate a private key in [1, p-1].
         let one = BigUint::from(1u8);
@@ -80,10 +113,34 @@ impl AppleDhAuth {
             key_length
         );
         let aes_key = md5::compute(&shared_bytes);
+        let wrap_key = aes_key.0;
+        log::debug!(
+            "Apple DH shared secret ({} B): head={:02x?}, tail={:02x?}",
+            shared_bytes.len(),
+            &shared_bytes[..shared_bytes.len().min(4)],
+            &shared_bytes[shared_bytes.len().saturating_sub(4)..]
+        );
+        log::debug!(
+            "Apple DH wrap key (MD5): head={:02x?}, tail={:02x?}",
+            &wrap_key[..4],
+            &wrap_key[12..]
+        );
 
         // Build 128-byte credential blob and encrypt it with AES-128-ECB.
         let mut blob = build_credential_blob(&self.username, &self.password, &mut rng);
-        encrypt_aes128_ecb(&mut blob, &aes_key.0);
+        log::debug!(
+            "Apple DH credential blob: username_len={}, password_len={}, first_byte=0x{:02x}, byte[64]=0x{:02x}",
+            self.username.len().min(63),
+            self.password.len().min(63),
+            blob[0],
+            blob[64]
+        );
+        log::debug!("Apple DH encrypting credential blob with AES-128-ECB");
+        encrypt_aes128_ecb(&mut blob, &wrap_key);
+        log::debug!(
+            "Apple DH encrypted credential blob: {}",
+            hex_snippet(&blob, 4, 4)
+        );
 
         stream.write_all(&blob)?;
 
@@ -94,12 +151,18 @@ impl AppleDhAuth {
             padded[key_length - client_public_bytes.len()..].copy_from_slice(&client_public_bytes);
             client_public_bytes = padded;
         }
+        log::debug!(
+            "Apple DH client public ({} B): {}",
+            client_public_bytes.len(),
+            hex_snippet(&client_public_bytes, 4, 4)
+        );
         stream.write_all(&client_public_bytes)?;
 
         // Read 4-byte security result.
         let mut result = [0u8; 4];
         stream.read_exact(&mut result)?;
         let result = u32::from_be_bytes(result);
+        log::debug!("Apple DH security result: {}", result);
         if result != 0 {
             return Err(VncError::AuthFailed(format!(
                 "Apple DH authentication failed: status {}",
@@ -108,7 +171,7 @@ impl AppleDhAuth {
         }
 
         log::debug!("Apple DH authentication succeeded");
-        Ok(())
+        Ok(wrap_key)
     }
 }
 
@@ -136,12 +199,15 @@ fn build_credential_blob(username: &str, password: &str, rng: &mut ThreadRng) ->
 }
 
 /// Encrypt data in-place using AES-128-ECB.
+///
+/// The credential blob is always 128 bytes, so no padding is needed.
 fn encrypt_aes128_ecb(data: &mut [u8; 128], key: &[u8; 16]) {
-    let cipher = Aes128::new_from_slice(key).expect("AES-128 key is 16 bytes");
+    let mut encryptor = Aes128EcbEnc::new((&key[..]).into());
+    // ECB encrypts each 16-byte block independently. The blob is a multiple of
+    // 16 bytes (128), so this split is exact and always succeeds.
     for chunk in data.chunks_mut(16) {
-        let mut block = GenericArray::clone_from_slice(chunk);
-        cipher.encrypt_block(&mut block);
-        chunk.copy_from_slice(&block);
+        let block = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
+        encryptor.encrypt_block_mut(block);
     }
 }
 
@@ -168,12 +234,20 @@ mod tests {
 
     #[test]
     fn aes128_ecb_roundtrip() {
-        let key = [0u8; 16];
-        let mut data = [0xabu8; 128];
+        use aes::cipher::BlockDecryptMut;
+        use ecb::Decryptor as EcbDecryptor;
+
+        type Aes128EcbDec = EcbDecryptor<aes::Aes128>;
+
+        let key = [0xabu8; 16];
+        let mut data = [0xcd_u8; 128];
         encrypt_aes128_ecb(&mut data, &key);
-        // AES-ECB with a constant key and constant plaintext must be deterministic.
-        let mut data2 = [0xabu8; 128];
-        encrypt_aes128_ecb(&mut data2, &key);
-        assert_eq!(data, data2);
+        // Decrypt manually to verify.
+        let mut decryptor = Aes128EcbDec::new((&key[..]).into());
+        for chunk in data.chunks_mut(16) {
+            let block = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
+            decryptor.decrypt_block_mut(block);
+        }
+        assert_eq!(data, [0xcd; 128]);
     }
 }
