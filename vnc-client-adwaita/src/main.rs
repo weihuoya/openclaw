@@ -324,7 +324,7 @@ fn show_connect_dialog(
     // Options group (previously in the Preferences window)
     let auth_row = combo_row_for_settings(
         &gettext("Authentication method"),
-        &["none", "password", "apple-dh"],
+        &["none", "password", "apple-dh", "vencrypt"],
         settings,
         "auth-method",
     );
@@ -338,6 +338,10 @@ fn show_connect_dialog(
         "preferred-encoding",
     );
 
+    let tls_row = adw::SwitchRow::new();
+    tls_row.set_title(&gettext("Use TLS"));
+    settings.bind("use-tls", &tls_row, "active").build();
+
     let view_only_row = adw::SwitchRow::new();
     view_only_row.set_title(&gettext("View only"));
     settings.bind("view-only", &view_only_row, "active").build();
@@ -350,6 +354,7 @@ fn show_connect_dialog(
     options_group.set_title(&gettext("Options"));
     options_group.add(&auth_row);
     options_group.add(&enc_row);
+    options_group.add(&tls_row);
     options_group.add(&view_only_row);
     options_group.add(&scale_row);
 
@@ -533,13 +538,27 @@ fn show_connect_dialog(
                         password.to_string(),
                     ))
                 }
-                _ => Box::new(NoAuthHandler),
+                "none" => Box::new(NoAuthHandler),
+                "vencrypt" => {
+                    let msg = gettext("VeNCrypt authentication is not yet supported");
+                    log::error!("{}", msg);
+                    dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
+                    return;
+                }
+                _ => {
+                    let msg = gettext("Unknown authentication method");
+                    log::error!("{}: {}", msg, auth_method);
+                    dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
+                    return;
+                }
             };
+
+            let use_tls = settings.boolean("use-tls");
 
             let preferred = settings.string("preferred-encoding");
             let encodings = build_encoding_list(&preferred);
 
-            match vnc_display.connect_with_options(&host, port, false, auth, &encodings) {
+            match vnc_display.connect_with_options(&host, port, use_tls, auth, &encodings) {
                 Ok(()) => {
                     dialog_connect_btn.set_sensitive(false);
                 }
@@ -603,6 +622,9 @@ fn update_auth_row_from_supported_types(
     }
     if supported_types.contains(&30) {
         options.push("apple-dh");
+    }
+    if supported_types.contains(&19) {
+        options.push("vencrypt");
     }
     if options.is_empty() {
         // The server offered nothing we can use; leave a placeholder so the
@@ -676,13 +698,13 @@ fn build_encoding_list(preferred: &str) -> Vec<Encoding> {
         _ => encodings.push(Encoding::Tight),
     }
 
-    // Fallback encodings (avoid Raw by default; servers tend to send it for
-    // full-frame updates and it is sensitive to exact pixel-format matching).
+    // Fallback encodings (always include Raw as a safe last-resort option).
     for enc in [
         Encoding::Zrle,
         Encoding::Hextile,
         Encoding::CopyRect,
         Encoding::OpenH264,
+        Encoding::Raw,
     ] {
         if !encodings.contains(&enc) {
             encodings.push(enc);

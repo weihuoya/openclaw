@@ -87,6 +87,7 @@ const GL_COMPILE_STATUS: GLenum = 0x8B81;
 const GL_LINK_STATUS: GLenum = 0x8B82;
 const GL_INFO_LOG_LENGTH: GLenum = 0x8B84;
 const GL_TEXTURE_2D: GLenum = 0x0DE1;
+const GL_TEXTURE0: GLenum = 0x84C0;
 const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
 const GL_LINEAR: GLint = 0x2601;
@@ -98,6 +99,7 @@ const GL_STATIC_DRAW: GLenum = 0x88E4;
 const GL_TRIANGLE_STRIP: GLenum = 0x0005;
 const GL_COLOR_BUFFER_BIT: GLbitfield = 0x00004000;
 const GL_VERSION: GLenum = 0x1F02;
+const GL_VERTEX_ARRAY_BINDING: GLenum = 0x85B5;
 
 #[link(name = "GLESv3")]
 extern "C" {
@@ -142,6 +144,7 @@ extern "C" {
     fn glUniform1i(location: GLint, v0: GLint);
     fn glGenTextures(n: GLsizei, textures: *mut GLuint);
     fn glBindTexture(target: GLenum, texture: GLuint);
+    fn glActiveTexture(texture: GLenum);
     fn glTexImage2D(
         target: GLenum,
         level: GLint,
@@ -176,6 +179,9 @@ extern "C" {
     fn glDeleteTextures(n: GLsizei, textures: *const GLuint);
     fn glDeleteBuffers(n: GLsizei, buffers: *const GLuint);
     fn glDeleteProgram(program: GLuint);
+    fn glGenVertexArrays(n: GLsizei, arrays: *mut GLuint);
+    fn glBindVertexArray(array: GLuint);
+    fn glDeleteVertexArrays(n: GLsizei, arrays: *const GLuint);
 }
 
 // ─── Shader sources ────────────────────────────────────────────────
@@ -220,22 +226,33 @@ pub struct EglRenderer {
     program: GLuint,
     texture: GLuint,
     vbo: GLuint,
+    vao: GLuint,
     width: i32,
     height: i32,
+    texture_width: i32,
+    texture_height: i32,
+    native_window: NativeWindow,
 }
 
 impl EglRenderer {
     /// Create a new renderer for the given Android [`NativeWindow`].
     pub fn new(native_window: &NativeWindow) -> Result<Self, String> {
+        // Acquire our own reference so the window stays alive even if the Java
+        // caller releases the original pointer immediately after this call.
+        let native_window = native_window.clone();
+
         unsafe {
             // 1. EGL display
             let display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
             if display == EGL_NO_DISPLAY {
                 return Err("eglGetDisplay failed".to_string());
             }
-            if eglInitialize(display, ptr::null_mut(), ptr::null_mut()) == EGL_FALSE {
+            let mut major: EGLint = 0;
+            let mut minor: EGLint = 0;
+            if eglInitialize(display, &mut major, &mut minor) == EGL_FALSE {
                 return Err("eglInitialize failed".to_string());
             }
+            log::debug!("EGL initialized {}.{}", major, minor);
 
             // 2. Choose config (OpenGL ES 3, window surface, RGB888)
             let attribs = [
@@ -288,7 +305,10 @@ impl EglRenderer {
             // 6. Compile shaders and link program
             let program = compile_program(VERTEX_SHADER, FRAGMENT_SHADER)?;
 
-            // 7. Upload vertex data
+            // 7. Create and bind a VAO, then upload vertex data to a VBO.
+            let mut vao: GLuint = 0;
+            glGenVertexArrays(1, &mut vao);
+            glBindVertexArray(vao);
             let mut vbo: GLuint = 0;
             glGenBuffers(1, &mut vbo);
             glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -324,6 +344,9 @@ impl EglRenderer {
                 (2 * std::mem::size_of::<f32>()) as *const c_void,
             );
 
+            // Unbind VAO so subsequent texture setup does not modify it.
+            glBindVertexArray(0);
+
             // 8. Create texture
             let mut texture: GLuint = 0;
             glGenTextures(1, &mut texture);
@@ -348,8 +371,12 @@ impl EglRenderer {
                 program,
                 texture,
                 vbo,
+                vao,
                 width,
                 height,
+                texture_width: 0,
+                texture_height: 0,
+                native_window,
             })
         }
     }
@@ -357,24 +384,60 @@ impl EglRenderer {
     /// Upload RGBA pixel data and draw a fullscreen quad.
     pub fn render_frame(&mut self, rgba: &[u8], width: u32, height: u32) {
         unsafe {
+            // Ensure this thread's EGL context is current before issuing GL commands.
+            if eglMakeCurrent(self.display, self.surface, self.surface, self.context) == EGL_FALSE {
+                log::error!("eglMakeCurrent failed before rendering");
+                return;
+            }
+
+            // Detect surface size changes and adjust the viewport.
+            let surface_width = self.native_window.width();
+            let surface_height = self.native_window.height();
+            if surface_width != self.width || surface_height != self.height {
+                self.width = surface_width;
+                self.height = surface_height;
+                glViewport(0, 0, surface_width, surface_height);
+            }
+
             glClearColor(0.0, 0.0, 0.0, 1.0);
             glClear(GL_COLOR_BUFFER_BIT);
 
+            glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, self.texture);
-            glTexImage2D(
-                GL_TEXTURE_2D,
-                0,
-                GL_RGBA as GLint,
-                width as GLsizei,
-                height as GLsizei,
-                0,
-                GL_RGBA,
-                GL_UNSIGNED_BYTE,
-                rgba.as_ptr().cast(),
-            );
+            let w = width as GLsizei;
+            let h = height as GLsizei;
+            if w == self.texture_width && h == self.texture_height {
+                // Same size as last frame: update texels in place.
+                glTexSubImage2D(
+                    GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    w,
+                    h,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    rgba.as_ptr().cast(),
+                );
+            } else {
+                // First frame or resized: allocate texture storage.
+                self.texture_width = w;
+                self.texture_height = h;
+                glTexImage2D(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA as GLint,
+                    w,
+                    h,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    rgba.as_ptr().cast(),
+                );
+            }
 
             glUseProgram(self.program);
-            glBindBuffer(GL_ARRAY_BUFFER, self.vbo);
+            glBindVertexArray(self.vao);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
             eglSwapBuffers(self.display, self.surface);
@@ -395,8 +458,9 @@ impl Drop for EglRenderer {
     fn drop(&mut self) {
         unsafe {
             glDeleteProgram(self.program);
-            glDeleteTextures(1, &self.texture);
+            glDeleteVertexArrays(1, &self.vao);
             glDeleteBuffers(1, &self.vbo);
+            glDeleteTextures(1, &self.texture);
             eglMakeCurrent(self.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             eglDestroySurface(self.display, self.surface);
             eglDestroyContext(self.display, self.context);
@@ -407,6 +471,9 @@ impl Drop for EglRenderer {
 
 // ─── Shader helpers ────────────────────────────────────────────────
 
+/// # Safety
+/// All GL functions are called through raw FFI pointers; caller must ensure a
+/// valid GL context is current and that `source` is a valid GLSL shader.
 unsafe fn compile_shader(source: &str, type_: GLenum) -> Result<GLuint, String> {
     let shader = glCreateShader(type_);
     let c_source = CString::new(source).unwrap();
@@ -428,6 +495,9 @@ unsafe fn compile_shader(source: &str, type_: GLenum) -> Result<GLuint, String> 
     Ok(shader)
 }
 
+/// # Safety
+/// All GL functions are called through raw FFI pointers; caller must ensure a
+/// valid GL context is current.
 unsafe fn compile_program(vs: &str, fs: &str) -> Result<GLuint, String> {
     let vs_id = compile_shader(vs, GL_VERTEX_SHADER)?;
     let fs_id = compile_shader(fs, GL_FRAGMENT_SHADER)?;

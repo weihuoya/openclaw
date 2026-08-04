@@ -19,6 +19,12 @@ use crate::VncError;
 /// 4. Client sends encrypted key (length-prefixed)
 /// 5. Server sends security result (4 bytes)
 /// 6. All subsequent traffic encrypted with AES-CTR (TigerVNC/noVNC use CTR, not CFB)
+///
+/// Security note: the RSA-AES VeNCrypt variant uses the same AES key and a
+/// zero IV for both read and write directions, so both directions share the
+/// same keystream. This is a known limitation of the protocol variant; callers
+/// should not rely on it for confidentiality against active attackers on the
+/// network segment.
 pub struct RsaAesAuth {
     key_size: usize,
 }
@@ -122,7 +128,12 @@ impl AesCtr {
 /// Writes are buffered until `flush()` is called to ensure atomicity:
 /// if a write fails mid-stream the cipher counter is not advanced,
 /// so the next retry starts from the same counter value.
-pub struct AesCfbStream {
+///
+/// Security note: this implementation uses the same AES key and zero IV for
+/// both directions, as specified by the RSA-AES VeNCrypt variant. This means
+/// both directions share the same keystream, which is a known protocol
+/// limitation.
+pub struct AesCtrStream {
     inner: TcpStream,
     read_cipher: AesCtr,
     write_cipher: AesCtr,
@@ -130,7 +141,7 @@ pub struct AesCfbStream {
     write_buffer: Vec<u8>,
 }
 
-impl AesCfbStream {
+impl AesCtrStream {
     pub fn new(inner: TcpStream, key: &[u8]) -> Result<Self, VncError> {
         let iv = vec![0u8; 16];
         let read_cipher = AesCtr::new(key, &iv)?;
@@ -152,7 +163,7 @@ impl AesCfbStream {
     }
 }
 
-impl Read for AesCfbStream {
+impl Read for AesCtrStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
@@ -162,7 +173,7 @@ impl Read for AesCfbStream {
     }
 }
 
-impl Write for AesCfbStream {
+impl Write for AesCtrStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // Buffer plaintext; encryption is deferred to flush() so that
         // partial TCP writes cannot leave the CTR counter out of sync.

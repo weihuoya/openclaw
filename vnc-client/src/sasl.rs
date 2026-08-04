@@ -31,15 +31,30 @@ impl SaslAuth {
     }
 
     pub fn authenticate(&self, stream: &mut dyn Stream) -> Result<(), VncError> {
+        const MAX_SASL_MECHANISMS: usize = 64;
+        const MAX_SASL_NAME_LEN: usize = 256;
+
         // Read number of mechanisms
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf)?;
         let num_mechanisms = u32::from_be_bytes(buf) as usize;
+        if num_mechanisms > MAX_SASL_MECHANISMS {
+            return Err(VncError::AuthFailed(format!(
+                "SASL mechanism count {} exceeds limit",
+                num_mechanisms
+            )));
+        }
 
         let mut mechanisms = Vec::with_capacity(num_mechanisms);
         for _ in 0..num_mechanisms {
             stream.read_exact(&mut buf)?;
             let len = u32::from_be_bytes(buf) as usize;
+            if len > MAX_SASL_NAME_LEN {
+                return Err(VncError::AuthFailed(format!(
+                    "SASL mechanism name length {} exceeds limit",
+                    len
+                )));
+            }
             let mut name = vec![0u8; len];
             stream.read_exact(&mut name)?;
             mechanisms.push(String::from_utf8_lossy(&name).to_string());

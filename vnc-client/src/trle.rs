@@ -91,8 +91,8 @@ fn decode_tile<R: Read>(
                 }
             }
         }
-        2..=17 => {
-            // Packed palette
+        2..=16 => {
+            // Packed palette (paletteSize is the subencoding value itself, 2..16).
             let num_colors = subencoding[0] as usize;
             let mut palette = vec![vec![0u8; bpp]; num_colors];
             for color in palette.iter_mut().take(num_colors) {

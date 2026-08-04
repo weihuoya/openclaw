@@ -187,6 +187,10 @@ impl VideoDecoder for MediaCodecDecoder {
             Some((w, h))
         }
     }
+
+    fn set_size(&self, width: u16, height: u16) {
+        let _ = self.configure(width, height);
+    }
 }
 
 // Safety: `MediaCodec` is thread-safe (AMediaCodec is refcounted), and we only

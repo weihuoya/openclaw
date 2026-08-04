@@ -14,6 +14,11 @@ pub trait VideoDecoder: Send {
 
     /// Get the negotiated video dimensions from the decoder.
     fn video_size(&self) -> Option<(u16, u16)>;
+
+    /// Inform the decoder of the expected video dimensions before decoding.
+    ///
+    /// The default implementation is a no-op for decoders that auto-detect size.
+    fn set_size(&self, _width: u16, _height: u16) {}
 }
 
 #[cfg(not(target_os = "android"))]

@@ -16,6 +16,32 @@ use vnc_client::{ConnectionStats, VncClient, VncEvent};
 
 use super::paintable::VncPaintable;
 
+/// Build a GTK4 cursor from a VNC cursor shape.
+fn build_cursor(shape: &CursorShape) -> Option<gdk::Cursor> {
+    if shape.width == 0 || shape.height == 0 {
+        return None;
+    }
+    let expected = shape.width as usize * shape.height as usize * 4;
+    if shape.pixels.len() != expected {
+        log::warn!("Cursor shape pixel size mismatch");
+        return None;
+    }
+    let bytes = glib::Bytes::from(&shape.pixels);
+    let texture = gdk::MemoryTexture::new(
+        shape.width as i32,
+        shape.height as i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        (shape.width as usize) * 4,
+    );
+    Some(gdk::Cursor::from_texture(
+        &texture,
+        shape.hotspot_x as i32,
+        shape.hotspot_y as i32,
+        None::<&gdk::Cursor>,
+    ))
+}
+
 /// Input events sent from the main thread to the background VNC thread.
 #[derive(Debug, Clone, Copy)]
 pub enum InputEvent {
@@ -78,6 +104,7 @@ mod imp {
         // Background thread control
         pub running: RefCell<Option<Arc<AtomicBool>>>,
         pub input_tx: RefCell<Option<mpsc::Sender<InputEvent>>>,
+        pub connected: RefCell<Arc<AtomicBool>>,
         pub frame_data: Arc<Mutex<Vec<FrameData>>>,
         pub cursor_data: Arc<Mutex<Vec<CursorShape>>>,
         pub error_queue: Arc<Mutex<Vec<String>>>,
@@ -213,10 +240,14 @@ mod imp {
 
     impl VncDisplayImp {
         fn scale_coords(&self, widget_x: f64, widget_y: f64) -> (u16, u16) {
-            let fb_w = self.width.get().max(1) as f64;
-            let fb_h = self.height.get().max(1) as f64;
             let widget_w = self.obj().width() as f64;
             let widget_h = self.obj().height() as f64;
+            if widget_w <= 0.0 || widget_h <= 0.0 {
+                return (0, 0);
+            }
+
+            let fb_w = self.width.get().max(1) as f64;
+            let fb_h = self.height.get().max(1) as f64;
 
             let scale_x = widget_w / fb_w;
             let scale_y = widget_h / fb_h;
@@ -335,6 +366,7 @@ mod imp {
             if let Some(ref running) = *self.running.borrow() {
                 running.store(false, Ordering::SeqCst);
             }
+            self.connected.borrow().store(false, Ordering::SeqCst);
             *self.running.borrow_mut() = None;
             *self.input_tx.borrow_mut() = None;
 
@@ -392,6 +424,7 @@ impl VncDisplay {
                 Encoding::Zrle,
                 Encoding::Hextile,
                 Encoding::CopyRect,
+                Encoding::Raw,
                 Encoding::DesktopSize,
                 Encoding::DesktopName,
                 Encoding::Cursor,
@@ -425,6 +458,9 @@ impl VncDisplay {
         let running = Arc::new(AtomicBool::new(true));
         let running_bg = running.clone();
         *imp.running.borrow_mut() = Some(running);
+        let connected = Arc::new(AtomicBool::new(true));
+        let connected_bg = connected.clone();
+        *imp.connected.borrow_mut() = connected;
 
         let frame_data = imp.frame_data.clone();
         let cursor_data = imp.cursor_data.clone();
@@ -456,6 +492,7 @@ impl VncDisplay {
                     .lock()
                     .unwrap()
                     .push(format!("Connection failed: {}", e));
+                connected_bg.store(false, Ordering::SeqCst);
                 running_bg.store(false, Ordering::SeqCst);
                 return;
             }
@@ -476,6 +513,7 @@ impl VncDisplay {
                         error: Some(e.to_string()),
                         supported_auth_types: supported,
                     });
+                connected_bg.store(false, Ordering::SeqCst);
                 running_bg.store(false, Ordering::SeqCst);
                 return;
             }
@@ -551,9 +589,10 @@ impl VncDisplay {
                     }
                 }
 
-                // Heartbeat: send a no-op pointer event every 5 seconds to keep connection alive
+                // Heartbeat: request an incremental update every 5 seconds to keep the connection alive.
                 if last_activity.elapsed() >= Duration::from_secs(5) {
-                    let _ = client.send_pointer_event(0, 0, 0);
+                    let (w, h) = client.dimensions();
+                    let _ = client.request_update(true, 0, 0, w, h);
                     last_activity = Instant::now();
                 }
 
@@ -618,18 +657,15 @@ impl VncDisplay {
                                 pixels: fb.data().to_vec(),
                             };
                             let mut queue = frame_data.lock().unwrap();
+                            // Only keep the most recent pending frame. The UI
+                            // drains the queue at ~60 Hz and older frames are
+                            // stale by the time they would be displayed.
+                            queue.clear();
                             queue.push(data);
                         }
                     }
-                    Err(vnc_client::VncError::Io(ref e))
-                        if e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
+                    Err(vnc_client::VncError::Timeout) => {
                         // Timeout, loop back to check input channel
-                    }
-                    Err(vnc_client::VncError::Io(ref e))
-                        if e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        // Read timeout, loop back to check input channel
                     }
                     Err(e) => {
                         log::error!("VNC read error: {}", e);
@@ -648,6 +684,7 @@ impl VncDisplay {
                     last_stats_sample = Instant::now();
                 }
             }
+            connected_bg.store(false, Ordering::SeqCst);
             running_bg.store(false, Ordering::SeqCst);
         });
 
@@ -692,8 +729,8 @@ impl VncDisplay {
                 queue.drain(..).collect()
             };
             for cursor in cursors {
-                if let Some(ref paintable) = *imp.paintable.borrow() {
-                    paintable.set_cursor(cursor);
+                if let Some(cursor) = build_cursor(&cursor) {
+                    obj.set_cursor(Some(&cursor));
                 }
             }
 
@@ -742,7 +779,8 @@ impl VncDisplay {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.imp().running.borrow().is_some()
+        let imp = self.imp();
+        imp.connected.borrow().load(Ordering::SeqCst) && imp.running.borrow().is_some()
     }
 
     pub fn set_view_only(&self, view_only: bool) {

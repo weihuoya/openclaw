@@ -17,9 +17,9 @@ impl Transform {
     pub fn map_coords(&self, x: usize, y: usize, width: usize, height: usize) -> (usize, usize) {
         match self {
             Transform::None => (x, y),
-            Transform::Rotate90 => (height - 1 - y, x),
+            Transform::Rotate90 => (y, height - 1 - x),
             Transform::Rotate180 => (width - 1 - x, height - 1 - y),
-            Transform::Rotate270 => (y, width - 1 - x),
+            Transform::Rotate270 => (width - 1 - y, x),
             Transform::FlipHorizontal => (width - 1 - x, y),
             Transform::FlipVertical => (x, height - 1 - y),
             Transform::FlipBoth => (width - 1 - x, height - 1 - y),
@@ -362,15 +362,15 @@ impl Framebuffer {
         let row_size = width * bytes_per_pixel;
 
         if src_y < dst_y || (src_y == dst_y && src_x < dst_x) {
-            // Copy bottom-up to handle overlap
+            // Copy bottom-up to handle vertical overlap.
             for row in (0..height).rev() {
                 let src_offset = ((src_y + row) * self.width + src_x) * bytes_per_pixel;
                 let dst_offset = ((dst_y + row) * self.width + dst_x) * bytes_per_pixel;
                 if src_offset + row_size <= self.data.len()
                     && dst_offset + row_size <= self.data.len()
                 {
-                    let tmp = self.data[src_offset..src_offset + row_size].to_vec();
-                    self.data[dst_offset..dst_offset + row_size].copy_from_slice(&tmp);
+                    self.data
+                        .copy_within(src_offset..src_offset + row_size, dst_offset);
                 }
             }
         } else {
@@ -380,8 +380,8 @@ impl Framebuffer {
                 if src_offset + row_size <= self.data.len()
                     && dst_offset + row_size <= self.data.len()
                 {
-                    let tmp = self.data[src_offset..src_offset + row_size].to_vec();
-                    self.data[dst_offset..dst_offset + row_size].copy_from_slice(&tmp);
+                    self.data
+                        .copy_within(src_offset..src_offset + row_size, dst_offset);
                 }
             }
         }

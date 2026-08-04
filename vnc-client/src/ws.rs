@@ -103,9 +103,11 @@ impl Write for WsStream {
 
     fn flush(&mut self) -> std::io::Result<()> {
         if !self.write_buf.is_empty() {
+            let data = self.write_buf.clone();
             self.ws
-                .write(tungstenite::Message::Binary(self.write_buf.clone()))
+                .write(tungstenite::Message::Binary(data))
                 .map_err(|e| std::io::Error::other(format!("WebSocket write error: {}", e)))?;
+            // Only clear the buffer after the message is accepted by tungstenite.
             self.write_buf.clear();
         }
         self.ws

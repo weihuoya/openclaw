@@ -50,7 +50,7 @@ pub fn decode<R: Read>(
     // Others keep a single stream for the whole session.
     let has_zlib_header = compressed.len() >= 2
         && (compressed[0] & 0x0F) == 8
-        && ((compressed[0] as u16) * 256 + (compressed[1] as u16)).trailing_zeros() >= 5;
+        && ((compressed[0] as u16) * 256 + (compressed[1] as u16)).is_multiple_of(31);
 
     let data = if has_zlib_header || decompress.is_none() {
         // Reset / initialize decompressor

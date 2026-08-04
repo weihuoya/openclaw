@@ -19,7 +19,12 @@
     <key name="auth-method" type="s">
       <default>'none'</default>
       <summary>Authentication method</summary>
-      <description>One of 'none', 'password', or 'apple-dh' (Apple Remote Desktop).</description>
+      <description>One of 'none', 'password', 'apple-dh' (Apple Remote Desktop), or 'vencrypt'.</description>
+    </key>
+    <key name="use-tls" type="b">
+      <default>false</default>
+      <summary>Use TLS</summary>
+      <description>Wrap the connection in TLS before the VNC handshake.</description>
     </key>
     <key name="preferred-encoding" type="s">
       <default>'zrle'</default>

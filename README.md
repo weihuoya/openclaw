@@ -7,6 +7,7 @@ A Rust VNC client library and display widgets implementing the RFB protocol.
 ```
 openclaw/
 ├── vnc-client/         # Core VNC client library (RFB protocol)
+├── vnc-server/         # Wayland VNC server (RFB protocol + wlr-screencopy)
 ├── vnc-widget-gtk4/    # GTK4 display widget
 ├── vnc-client-adwaita/ # Adwaita GTK4 desktop VNC client
 └── vnc-client-android/ # Android display scaffold
@@ -35,8 +36,9 @@ Pure Rust VNC client library implementing the RFB protocol.
 - [x] Continuous updates and `EndOfContinuousUpdates`
 - [x] Cursor pseudo-encoding and desktop-size pseudo-encodings
 - [ ] Zlib encoding
-- [ ] VeNCrypt stream encryption (subtypes negotiate; TLS/X509 not wired, RSA-AES/AES-256 handshakes but does not encrypt the stream)
-- [ ] OpenH264/decoder hardware paths on Android
+- [x] VeNCrypt security negotiation (subtypes 0/1/2/256/22/26/27/30 are wired; X509 is handled as TLS + certificate validation via rustls)
+- [x] RSA-AES/RSA-AES-256 VeNCrypt sub-types (handshake + AES-CTR stream encryption)
+- [x] OpenH264 decoding via GStreamer on Linux (client), with H.264 NALU parser and NdkMediaCodec scaffolding on Android
 
 ### Usage
 
@@ -74,6 +76,29 @@ for event in events {
 }
 ```
 
+## vnc-server
+
+Wayland-native VNC server built on `wlr-screencopy-unstable-v1` and `wlr-virtual-pointer`.
+
+### Features
+
+- [x] TCP listener and RFB 3.8 handshake (None + VNC password auth)
+- [x] Raw, Hextile, Tight, and ZRLE frame encoders
+- [x] Wayland screen capture with tile-based damage tracking
+- [x] Virtual pointer and uinput virtual keyboard input
+- [x] Continuous updates, desktop resize, and extended desktop size
+- [x] Bidirectional clipboard via `wlr-data-control`
+- [x] JSON Unix-socket control interface (`status`, `set-password`, `set-rate`, `set-output`, `disconnect-client`, ...)
+- [ ] CopyRect, RRE, TRLE encoders
+- [ ] Cursor pseudo-encoding
+- [ ] TLS / VeNCrypt / RSA-AES security
+
+### Build
+
+```bash
+cargo build -p vnc-server
+```
+
 ## vnc-widget-gtk4
 
 GTK4 VNC display widget (`gtk4_vnc`).
@@ -102,14 +127,6 @@ display.connect_to_host("192.168.1.100", 5900)?;
 // Embed it in your GTK4 application like any other widget.
 ```
 
-### Example
-
-Run the GTK4 viewer:
-
-```bash
-cargo run --example gtk4_vnc_viewer -p vnc-widget-gtk4
-```
-
 ## vnc-client-adwaita
 
 Desktop VNC client using **libadwaita** / GTK4 and GSettings.
@@ -119,8 +136,10 @@ Desktop VNC client using **libadwaita** / GTK4 and GSettings.
 - [x] Adwaita-style GTK4 UI (header bar, toast overlay, preferences dialog)
 - [x] Reuses `VncDisplay` from `vnc-widget-gtk4` for remote framebuffer rendering
 - [x] Supports **no authentication**, **VNC password authentication**, and **Apple Remote Desktop authentication**
+- [x] TLS toggle for `connect_with_options`
+- [x] VeNCrypt security type advertised in the auth dropdown (selecting it shows a "not yet supported" message instead of silently downgrading)
 - [x] Settings persisted to GSettings:
-  - host, port, username, auth method
+  - host, port, username, auth method, **use-tls**
   - preferred encoding, view-only, scale-to-fit
 - [x] Multi-language UI via gettext (English, Simplified Chinese)
 - [x] Desktop entry (`.desktop`) and application icon
@@ -156,10 +175,13 @@ packaging instructions.
 Android integration scaffold for `vnc-client`.
 
 - [x] Re-exports the core `VncClient` API
-- [x] `AndroidVncDisplay` connection helper
-- [ ] JNI bindings and `Surface`/`ANativeWindow` rendering
-- [ ] Touch-to-mouse mapping
-- [ ] `MediaCodec` hardware decoding
+- [x] `AndroidVncDisplay` connection helper with password / Apple Remote Desktop auth callbacks
+- [x] OpenGL ES 3 + EGL renderer with VAO, persistent texture, and surface-size detection
+- [x] Background read/render loop (`vnc_display_start_loop` / `vnc_display_stop_loop`)
+- [x] C ABI exports for connection, surface, input, and keyboard events
+- [ ] JNI bindings and Java/Kotlin lifecycle helpers
+- [ ] Touch-to-mouse gesture mapping
+- [ ] `MediaCodec` hardware decoding (scaffolding present; needs SPS/PPS plumbing)
 
 ## Development Plan
 

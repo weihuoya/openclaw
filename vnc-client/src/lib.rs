@@ -103,7 +103,7 @@ pub use stats::ConnectionStats;
 enum VncStreamInner {
     Plain(TcpStream),
     Tls(Box<TlsStream>),
-    Aes(Box<rsa_aes::AesCfbStream>),
+    Aes(Box<rsa_aes::AesCtrStream>),
     Ws(Box<ws::WsStream>),
     AppleHp(Box<apple_record_layer::AppleRecordLayer<TcpStream>>),
 }
@@ -396,6 +396,8 @@ pub enum VncError {
     ServerClosed,
     #[error("Not connected")]
     NotConnected,
+    #[error("Read timed out")]
+    Timeout,
 }
 
 impl VncClient {
@@ -439,6 +441,11 @@ impl VncClient {
         self.stream.as_mut().ok_or(VncError::NotConnected)
     }
 
+    /// Connect to a VNC server over plain TCP.
+    ///
+    /// Note: this does not set the hostname used for TLS certificate verification.
+    /// If you later upgrade to TLS (e.g. via VeNCrypt), call [`Self::set_host`] first,
+    /// or use [`Self::connect_with_host`] instead.
     pub fn connect<A: ToSocketAddrs>(&mut self, addr: A) -> Result<(), VncError> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
@@ -449,6 +456,16 @@ impl VncClient {
         });
         self.state = ClientState::Connected;
         Ok(())
+    }
+
+    /// Connect to a plain TCP server and record the hostname for later TLS upgrades.
+    ///
+    /// This is a convenience wrapper around [`Self::connect`] and [`Self::set_host`].
+    /// If you plan to upgrade the connection to TLS (e.g. via VeNCrypt), use this
+    /// method or call `set_host` before the TLS upgrade.
+    pub fn connect_with_host(&mut self, host: &str, port: u16) -> Result<(), VncError> {
+        self.set_host(host);
+        self.connect((host, port))
     }
 
     /// Set the server hostname for TLS certificate verification.
@@ -763,7 +780,7 @@ impl VncClient {
                         };
                         let rsa_auth = rsa_aes::RsaAesAuth::new_128();
                         let key = rsa_auth.authenticate(&mut tcp)?;
-                        let aes = rsa_aes::AesCfbStream::new(tcp, &key)?;
+                        let aes = rsa_aes::AesCtrStream::new(tcp, &key)?;
                         self.stream = Some(VncStream {
                             inner: VncStreamInner::Aes(Box::new(aes)),
                             bytes_read,
@@ -813,7 +830,7 @@ impl VncClient {
                         };
                         let rsa_auth = rsa_aes::RsaAesAuth::new_256();
                         let key = rsa_auth.authenticate(&mut tcp)?;
-                        let aes = rsa_aes::AesCfbStream::new(tcp, &key)?;
+                        let aes = rsa_aes::AesCtrStream::new(tcp, &key)?;
                         self.stream = Some(VncStream {
                             inner: VncStreamInner::Aes(Box::new(aes)),
                             bytes_read,
@@ -1350,6 +1367,11 @@ impl VncClient {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 return Err(VncError::ServerClosed);
             }
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut
+            {
+                return Err(VncError::Timeout);
+            }
             return Err(e.into());
         }
 
@@ -1855,6 +1877,8 @@ impl VncClient {
         }
 
         let decoder = self.h264_decoder.as_ref().unwrap();
+        // Ensure the decoder knows the expected frame size before decoding.
+        decoder.set_size(width, height);
         let rgba = decoder.decode_frame(&data)?;
         let rgba_format = PixelFormat::rgba32();
 
@@ -1927,10 +1951,18 @@ impl VncClient {
         &mut self,
         events: &mut Vec<VncEvent>,
     ) -> Result<(), VncError> {
+        const MAX_DESKTOP_NAME_LEN: usize = 4096;
+
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf)?;
         let name_len = u32::from_be_bytes(buf) as usize;
+        if name_len > MAX_DESKTOP_NAME_LEN {
+            return Err(VncError::Protocol(format!(
+                "DesktopName length {} exceeds limit",
+                name_len
+            )));
+        }
         let mut name_buf = vec![0u8; name_len];
         stream.read_exact(&mut name_buf)?;
         self.name = String::from_utf8_lossy(&name_buf).to_string();
@@ -1946,10 +1978,18 @@ impl VncClient {
         height: u16,
         events: &mut Vec<VncEvent>,
     ) -> Result<(), VncError> {
+        const MAX_SCREENS: usize = 256;
+
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf)?;
         let num_screens = u32::from_be_bytes(buf) as usize;
+        if num_screens > MAX_SCREENS {
+            return Err(VncError::Protocol(format!(
+                "ExtendedDesktopSize screen count {} exceeds limit",
+                num_screens
+            )));
+        }
 
         // Read screen data (each screen: u32 id, u16 x, u16 y, u16 width, u16 height, u32 flags)
         let screen_data_size = num_screens * 16;
@@ -2045,6 +2085,13 @@ impl VncClient {
             let mut payload = vec![0u8; compressed_len];
             stream.read_exact(&mut payload)?;
             let cursor = self.decode_apple_cursor_store(width, height, &payload)?;
+            const MAX_APPLE_CURSOR_CACHE: usize = 64;
+            if self.apple_cursor_cache.len() >= MAX_APPLE_CURSOR_CACHE {
+                // Evict an arbitrary entry to bound memory use.
+                if let Some(key) = self.apple_cursor_cache.keys().next().copied() {
+                    self.apple_cursor_cache.remove(&key);
+                }
+            }
             self.apple_cursor_cache.insert(cache_id, cursor);
             log::debug!(
                 "Apple cursor STORE cache_id={} size={}x{}",
@@ -2213,6 +2260,8 @@ impl VncClient {
     }
 
     fn handle_server_cut_text(&mut self, events: &mut Vec<VncEvent>) -> Result<(), VncError> {
+        const MAX_CUT_TEXT_LEN: usize = 10 * 1024 * 1024;
+
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         let mut buf = [0u8; 7];
         stream.read_exact(&mut buf)?;
@@ -2221,6 +2270,12 @@ impl VncClient {
 
         if len >= 0 {
             let len = len as usize;
+            if len > MAX_CUT_TEXT_LEN {
+                return Err(VncError::Protocol(format!(
+                    "ServerCutText length {} exceeds limit",
+                    len
+                )));
+            }
             let mut text = vec![0u8; len];
             stream.read_exact(&mut text)?;
             events.push(VncEvent::CutText(
@@ -2230,6 +2285,12 @@ impl VncClient {
             // Extended Clipboard format: abs(length) bytes of extended data
             // follow the header. The first 4 bytes of that data are flags.
             let len = len.unsigned_abs() as usize;
+            if len > MAX_CUT_TEXT_LEN {
+                return Err(VncError::Protocol(format!(
+                    "ExtendedClipboard data length {} exceeds limit",
+                    len
+                )));
+            }
             let mut data = vec![0u8; len];
             stream.read_exact(&mut data)?;
             let message = clipboard::decode_message(&data)?;
@@ -2557,12 +2618,13 @@ impl VncClientBuilder {
 
     /// Enable Apple high-performance mode (RFB 003.889 + RSA-SRP + encrypted record layer).
     ///
-    /// When enabled, the default encoding list is replaced with the Apple HP
-    /// encoding set. You can override it with [`Self::encodings`] afterwards.
+    /// When enabled, the Apple HP encodings are prepended to the current
+    /// encoding list rather than replacing it, so user-supplied fallbacks are
+    /// preserved.
     pub fn high_performance(mut self, enable: bool) -> Self {
         self.high_performance = enable;
         if enable {
-            self.encodings = vec![
+            let hp_encodings = vec![
                 Encoding::AppleHp(1010),
                 Encoding::AppleHp(1011),
                 Encoding::AppleHp(1002),
@@ -2577,6 +2639,15 @@ impl VncClientBuilder {
                 Encoding::AppleHp(1109),
                 Encoding::AppleHp(1110),
             ];
+            // Merge user's existing encodings after the HP ones, preserving
+            // order and avoiding duplicates.
+            let mut merged = hp_encodings;
+            for enc in self.encodings.drain(..) {
+                if !merged.contains(&enc) {
+                    merged.push(enc);
+                }
+            }
+            self.encodings = merged;
         }
         self
     }
@@ -2685,6 +2756,27 @@ mod tests {
             .encodings(vec![Encoding::Raw, Encoding::CopyRect])
             .build();
         assert_eq!(client.encodings, vec![Encoding::Raw, Encoding::CopyRect]);
+    }
+
+    #[test]
+    fn high_performance_preserves_user_encodings() {
+        let client = VncClientBuilder::new()
+            .encodings(vec![Encoding::Raw, Encoding::CopyRect])
+            .high_performance(true)
+            .build();
+        assert!(client.high_performance);
+        assert_eq!(client.encodings[0], Encoding::AppleHp(1010));
+        assert!(client.encodings.contains(&Encoding::Raw));
+        assert!(client.encodings.contains(&Encoding::CopyRect));
+        // Apple HP encodings come first; duplicates are removed.
+        assert_eq!(
+            client
+                .encodings
+                .iter()
+                .filter(|&&e| e == Encoding::Raw)
+                .count(),
+            1
+        );
     }
 
     #[test]

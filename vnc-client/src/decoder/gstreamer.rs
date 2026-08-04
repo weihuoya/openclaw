@@ -12,17 +12,19 @@ use crate::{decoder::VideoDecoder, VncError};
 static GST_INIT: Once = Once::new();
 
 fn debug_save_h264(data: &[u8]) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/openclaw_h264_debug.h264")
-    {
+    let Some(path) = std::env::var_os("OPENCLAW_H264_DEBUG") else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(data);
     }
 }
 
 fn debug_clear_h264_dump() {
-    let _ = std::fs::remove_file("/tmp/openclaw_h264_debug.h264");
+    let Some(path) = std::env::var_os("OPENCLAW_H264_DEBUG") else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
 }
 
 fn init_gstreamer() -> Result<(), VncError> {

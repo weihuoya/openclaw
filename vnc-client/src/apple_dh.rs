@@ -32,6 +32,10 @@ fn hex_snippet(data: &[u8], head: usize, tail: usize) -> String {
 /// perform a Diffie-Hellman key exchange, then send the username and password
 /// encrypted with AES-128-ECB using an MD5-derived key from the shared secret.
 ///
+/// Security note: AES-ECB and MD5 are legacy algorithms that are no longer
+/// considered secure by modern standards. This implementation is provided only
+/// for compatibility with macOS Screen Sharing's legacy protocol.
+///
 /// Protocol reference:
 /// - `vnc-client/reference/apple_vnc_rfc.md` §4.2.3
 /// - <https://www.tenable.com/blog/detecting-macos-high-sierra-root-account-without-authentication>

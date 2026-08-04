@@ -1,7 +1,6 @@
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, glib, graphene};
-use vnc_client::cursor::CursorShape;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -59,7 +58,9 @@ mod imp {
         }
 
         fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
-            let snapshot = snapshot.downcast_ref::<gtk4::Snapshot>().unwrap();
+            let Some(snapshot) = snapshot.downcast_ref::<gtk4::Snapshot>() else {
+                return;
+            };
 
             let texture_guard = self.texture.borrow();
             let Some(texture) = texture_guard.as_ref() else {
@@ -105,6 +106,18 @@ impl VncPaintable {
             return;
         }
 
+        let expected = (width as usize) * (height as usize) * 4;
+        if data.len() != expected {
+            log::warn!(
+                "VncPaintable: received {} bytes for {}x{} (expected {}), ignoring",
+                data.len(),
+                width,
+                height,
+                expected
+            );
+            return;
+        }
+
         let size_changed = imp.width.get() != width || imp.height.get() != height;
 
         // Try GPU path on first update or when size changes
@@ -139,6 +152,9 @@ impl VncPaintable {
 
     fn try_init_gpu(&self, width: i32, height: i32) -> Result<(), String> {
         let imp = self.imp();
+
+        // Release any previous GPU resources before creating new ones.
+        self.cleanup_gpu();
 
         // Get default display and create GL context
         let display = gdk::Display::default().ok_or("No display")?;
@@ -241,20 +257,10 @@ impl VncPaintable {
         *imp.texture.borrow_mut() = Some(texture.upcast());
     }
 
-    /// Update cursor shape. The paintable itself doesn't render the cursor;
-    /// the widget uses this to set the GdkCursor.
-    pub fn set_cursor(&self, _shape: CursorShape) {
-        // Cursor rendering is handled by the widget via gdk::Cursor
-    }
-
-    /// Clear the paintable (show black).
-    pub fn clear(&self) {
+    /// Release any GL context and texture owned by the paintable.
+    fn cleanup_gpu(&self) {
         let imp = self.imp();
-        *imp.texture.borrow_mut() = None;
-        imp.width.set(0);
-        imp.height.set(0);
-        imp.use_gpu.set(false);
-        if let Some(ref context) = *imp.gl_context.borrow() {
+        if let Some(context) = imp.gl_context.borrow_mut().take() {
             let id = imp.gl_texture_id.get();
             if id != 0 {
                 context.make_current();
@@ -263,8 +269,17 @@ impl VncPaintable {
                 }
             }
         }
-        *imp.gl_context.borrow_mut() = None;
         imp.gl_texture_id.set(0);
+        imp.use_gpu.set(false);
+    }
+
+    /// Clear the paintable (show black).
+    pub fn clear(&self) {
+        let imp = self.imp();
+        *imp.texture.borrow_mut() = None;
+        imp.width.set(0);
+        imp.height.set(0);
+        self.cleanup_gpu();
         self.invalidate_size();
         self.invalidate_contents();
     }
