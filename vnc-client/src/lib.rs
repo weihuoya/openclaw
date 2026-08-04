@@ -197,6 +197,43 @@ impl VncStream {
             )),
         }
     }
+
+    /// Build an Apple HP encrypted key event (0x10, subtype 1) if the record
+    /// layer is active.
+    pub fn build_apple_encrypted_key_event(
+        &self,
+        down: bool,
+        keysym: u32,
+        key_type: u16,
+        key_code: u16,
+    ) -> Result<Vec<u8>, VncError> {
+        match &self.inner {
+            VncStreamInner::AppleHp(layer) => {
+                Ok(layer.build_encrypted_key_event(down, keysym, key_type, key_code))
+            }
+            _ => Err(VncError::Protocol(
+                "Apple record layer not active".to_string(),
+            )),
+        }
+    }
+
+    /// Build an Apple HP encrypted pointer event (0x10, subtype 3) if the
+    /// record layer is active.
+    pub fn build_apple_encrypted_pointer_event(
+        &self,
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<Vec<u8>, VncError> {
+        match &self.inner {
+            VncStreamInner::AppleHp(layer) => {
+                Ok(layer.build_encrypted_pointer_event(button_mask, x, y))
+            }
+            _ => Err(VncError::Protocol(
+                "Apple record layer not active".to_string(),
+            )),
+        }
+    }
 }
 
 impl Read for VncStream {
@@ -373,6 +410,22 @@ pub enum VncEvent {
     },
     /// Multi-monitor screen layout changed.
     ScreenLayout(Vec<Screen>),
+    /// Keyboard input source information received from the server (Apple HP).
+    KeyboardInputSource {
+        input_source_id: String,
+        secure_event_input: bool,
+    },
+    /// Device information received from the server (Apple HP).
+    DeviceInfo {
+        device_identifier: String,
+        device_color: String,
+        enclosure_color: String,
+        enclosure_rgb_color: u32,
+        housing_color: i32,
+    },
+    /// Remote clipboard changed; the caller may call `request_clipboard_fetch` to
+    /// pull the updated pasteboard (Apple HP).
+    ClipboardChanged,
     /// Audio data received (QEMU extension).
     Audio {
         sample_rate: u32,
@@ -1239,6 +1292,125 @@ impl VncClient {
         Ok(())
     }
 
+    /// Send an encrypted Apple HP key event (0x10).
+    ///
+    /// Only available when the session is in Apple high-performance mode and the
+    /// encrypted record layer is active. `key_type` and `key_code` are Apple-specific
+    /// fields that callers without native key information can leave as `0`.
+    pub fn send_hp_key_event(
+        &mut self,
+        down: bool,
+        keysym: u32,
+        key_type: u16,
+        key_code: u16,
+    ) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        let msg = stream.build_apple_encrypted_key_event(down, keysym, key_type, key_code)?;
+        stream.write_all(&msg)?;
+        Ok(())
+    }
+
+    /// Send an encrypted Apple HP pointer event (0x10).
+    ///
+    /// Only available when the session is in Apple high-performance mode and the
+    /// encrypted record layer is active. The `button_mask` uses the standard RFB
+    /// layout (RFC 6143); the right/middle bits are swapped into the Apple HP
+    /// wire format automatically.
+    pub fn send_hp_pointer_event(
+        &mut self,
+        button_mask: u8,
+        x: u16,
+        y: u16,
+    ) -> Result<(), VncError> {
+        let button_mask = apple_pointer_button_mask(button_mask);
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        let msg = stream.build_apple_encrypted_pointer_event(button_mask, x, y)?;
+        stream.write_all(&msg)?;
+        Ok(())
+    }
+
+    /// Send an Apple HP `SetMode` (0x0a) message.
+    ///
+    /// `mode = 0` is observe-only, `mode = 1` is normal control. This message is
+    /// optional; native Screen Sharing.app sends it during the plaintext prelude.
+    pub fn send_hp_set_mode(&mut self, mode: u16) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&apple_record_layer::build_set_mode(mode))?;
+        Ok(())
+    }
+
+    /// Send an Apple HP `ScaleFactor` (0x08) message.
+    ///
+    /// The server uses a positive scale factor to decide whether to downscale the
+    /// framebuffer stream. This is typically sent during the encrypted preface.
+    pub fn send_hp_scale_factor(&mut self, scale: f64) -> Result<(), VncError> {
+        if scale <= 0.0 {
+            return Err(VncError::Protocol(format!(
+                "Apple HP scale factor must be positive, got {}",
+                scale
+            )));
+        }
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&apple_record_layer::build_scale_factor(scale))?;
+        Ok(())
+    }
+
+    /// Send an Apple HP `SetDisplayMessage` (0x0d) message.
+    ///
+    /// When `combine_all_displays` is true, `display_id` is ignored and the server
+    /// selects the combined-display aggregate.
+    pub fn send_hp_set_display_message(
+        &mut self,
+        combine_all_displays: bool,
+        display_id: u32,
+    ) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&apple_record_layer::build_set_display_message(
+            combine_all_displays,
+            display_id,
+        ))?;
+        Ok(())
+    }
+
+    /// Send an Apple HP `AutoPasteboard` (0x15) command.
+    ///
+    /// `selector = 1` starts monitoring the local pasteboard for universal-clipboard
+    /// sync; `selector = 2` stops it. Only selectors `1` and `2` are accepted by the
+    /// server.
+    pub fn send_hp_auto_pasteboard(&mut self, selector: u8) -> Result<(), VncError> {
+        if selector != 1 && selector != 2 {
+            return Err(VncError::Protocol(format!(
+                "Apple HP AutoPasteboard selector must be 1 or 2, got {}",
+                selector
+            )));
+        }
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&apple_record_layer::build_auto_pasteboard(selector))?;
+        Ok(())
+    }
+
+    /// Send an Apple HP `SetKeyboardInputSource` (0x1a) message.
+    ///
+    /// Carries the keyboard input-source identifier (e.g.
+    /// `"com.apple.keylayout.ABC"`) to the server agent.
+    pub fn send_hp_set_keyboard_input_source(&mut self, source_id: &str) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&apple_record_layer::build_set_keyboard_input_source(
+            source_id,
+        ))?;
+        Ok(())
+    }
+
+    /// Request a remote pasteboard fetch after a `ClipboardChanged` event (Apple HP).
+    ///
+    /// Sends a `ClipboardFetch` (0x0b) message; the server replies with the current
+    /// pasteboard contents via the standard `ServerCutText` / `ClipboardSend` path.
+    pub fn request_clipboard_fetch(&mut self) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&apple_record_layer::build_clipboard_fetch())?;
+        Ok(())
+    }
+
     /// Enable continuous updates (server pushes frames without client requests).
     pub fn enable_continuous_updates(
         &mut self,
@@ -1425,13 +1597,8 @@ impl VncClient {
                 self.handle_qemu_extension(&mut events)
             }
             protocol::apple::MISC_STATUS => {
-                // Apple MiscStatus (8-byte control message); ignore for now.
-                log::debug!("Server message: Apple MiscStatus (ignored)");
                 self.last_msg_type = Some(protocol::apple::MISC_STATUS);
-                let mut skip = [0u8; 7];
-                let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-                stream.read_exact(&mut skip)?;
-                Ok(())
+                self.handle_apple_misc_status(&mut events)
             }
             _ => {
                 let bytes_read = self.stream.as_ref().map(|s| s.bytes_read()).unwrap_or(0);
@@ -1555,36 +1722,11 @@ impl VncClient {
                     continue;
                 }
                 enc if enc == protocol::apple::ENC_KEYBOARD_INPUT_SOURCE => {
-                    // Apple keyboard input source (u16 prefix_len + payload).
-                    let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-                    let mut prefix = [0u8; 2];
-                    stream.read_exact(&mut prefix)?;
-                    let prefix_len = u16::from_be_bytes(prefix) as usize;
-                    let mut payload = vec![0u8; prefix_len];
-                    stream.read_exact(&mut payload)?;
-                    log::debug!(
-                        "Apple keyboard input source (encoding {:#x}) ignored",
-                        protocol::apple::ENC_KEYBOARD_INPUT_SOURCE
-                    );
+                    self.handle_apple_keyboard_input_source(events)?;
                     continue;
                 }
                 enc if enc == protocol::apple::ENC_DEVICE_INFO => {
-                    // Apple device info (u16 message_size + message_size bytes).
-                    let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-                    let mut msg_size_buf = [0u8; 2];
-                    stream.read_exact(&mut msg_size_buf)?;
-                    let msg_size = u16::from_be_bytes(msg_size_buf) as usize;
-                    if msg_size < 2 {
-                        return Err(VncError::Protocol(
-                            "Apple device info message size too small".to_string(),
-                        ));
-                    }
-                    let mut payload = vec![0u8; msg_size - 2];
-                    stream.read_exact(&mut payload)?;
-                    log::debug!(
-                        "Apple device info (encoding {:#x}) ignored",
-                        protocol::apple::ENC_DEVICE_INFO
-                    );
+                    self.handle_apple_device_info(events)?;
                     continue;
                 }
                 enc if enc == protocol::apple::ENC_MEDIA_STREAM => {
@@ -2259,6 +2401,104 @@ impl VncClient {
         self.request_update(false, 0, 0, self.width, self.height)
     }
 
+    /// Handle the Apple `KeyboardInputSource` pseudo-encoding (`0x455`).
+    fn handle_apple_keyboard_input_source(
+        &mut self,
+        events: &mut Vec<VncEvent>,
+    ) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        let mut prefix = [0u8; 2];
+        stream.read_exact(&mut prefix)?;
+        let prefix_len = u16::from_be_bytes(prefix) as usize;
+        if prefix_len < 8 {
+            return Err(VncError::Protocol(format!(
+                "Apple keyboard input source prefix length too small: {}",
+                prefix_len
+            )));
+        }
+        let mut payload = vec![0u8; prefix_len];
+        stream.read_exact(&mut payload)?;
+
+        let Some(info) = parse_apple_keyboard_input_source(&payload) else {
+            return Err(VncError::Protocol(
+                "Apple keyboard input source payload malformed".to_string(),
+            ));
+        };
+        log::debug!(
+            "Apple keyboard input source: version_marker={} flags={} id={:?}",
+            info.version_marker,
+            info.keyboard_input_flags,
+            info.input_source_id
+        );
+        events.push(VncEvent::KeyboardInputSource {
+            input_source_id: info.input_source_id,
+            secure_event_input: info.secure_event_input,
+        });
+        Ok(())
+    }
+
+    /// Handle the Apple `DeviceInfo` pseudo-encoding (`0x456`).
+    fn handle_apple_device_info(&mut self, events: &mut Vec<VncEvent>) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        let mut msg_size_buf = [0u8; 2];
+        stream.read_exact(&mut msg_size_buf)?;
+        let msg_size = u16::from_be_bytes(msg_size_buf) as usize;
+        if msg_size < 2 {
+            return Err(VncError::Protocol(
+                "Apple device info message size too small".to_string(),
+            ));
+        }
+        let mut payload = vec![0u8; msg_size - 2];
+        stream.read_exact(&mut payload)?;
+
+        let Some(info) = parse_apple_device_info(&payload) else {
+            return Err(VncError::Protocol(
+                "Apple device info payload malformed".to_string(),
+            ));
+        };
+        log::debug!(
+            "Apple device info: structure_version={} enclosure_rgb_color={} housing_color={} identifier={:?}",
+            info.structure_version,
+            info.enclosure_rgb_color,
+            info.housing_color,
+            info.device_identifier
+        );
+        events.push(VncEvent::DeviceInfo {
+            device_identifier: info.device_identifier,
+            device_color: info.device_color,
+            enclosure_color: info.enclosure_color,
+            enclosure_rgb_color: info.enclosure_rgb_color,
+            housing_color: info.housing_color,
+        });
+        Ok(())
+    }
+
+    /// Handle the Apple `MiscStatus` server-to-client control message (`0x14`).
+    fn handle_apple_misc_status(&mut self, events: &mut Vec<VncEvent>) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        let mut buf = [0u8; 7];
+        stream.read_exact(&mut buf)?;
+        let _body_len = u16::from_be_bytes([buf[1], buf[2]]);
+        let _flags = u16::from_be_bytes([buf[3], buf[4]]);
+        let cmd = u16::from_be_bytes([buf[5], buf[6]]);
+        match cmd {
+            12 => {
+                log::debug!("Apple MiscStatus: heartbeat");
+            }
+            2 => {
+                log::debug!("Apple MiscStatus: remote clipboard changed");
+                events.push(VncEvent::ClipboardChanged);
+            }
+            11 => {
+                log::debug!("Apple MiscStatus: user session changed");
+            }
+            other => {
+                log::debug!("Apple MiscStatus: unknown cmd={}", other);
+            }
+        }
+        Ok(())
+    }
+
     fn handle_server_cut_text(&mut self, events: &mut Vec<VncEvent>) -> Result<(), VncError> {
         const MAX_CUT_TEXT_LEN: usize = 10 * 1024 * 1024;
 
@@ -2545,6 +2785,98 @@ fn parse_apple_display_layout(payload: &[u8]) -> Option<(u16, u16, u16, u16, Vec
         backing_height,
         screens,
     ))
+}
+
+/// Parsed Apple `KeyboardInputSource` (0x455) rectangle payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppleKeyboardInputSource {
+    pub version_marker: u16,
+    pub keyboard_input_flags: u32,
+    pub input_source_id: String,
+    pub secure_event_input: bool,
+}
+
+/// Parse an Apple `KeyboardInputSource` (`0x455`) rectangle payload.
+///
+/// Returns `None` if the payload is too short or malformed.
+fn parse_apple_keyboard_input_source(payload: &[u8]) -> Option<AppleKeyboardInputSource> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let version_marker = u16::from_be_bytes([payload[0], payload[1]]);
+    let keyboard_input_flags = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
+    let id_len = u16::from_be_bytes([payload[6], payload[7]]) as usize;
+    if 8 + id_len > payload.len() {
+        return None;
+    }
+    let input_source_id = String::from_utf8_lossy(&payload[8..8 + id_len]).to_string();
+    Some(AppleKeyboardInputSource {
+        version_marker,
+        keyboard_input_flags,
+        input_source_id,
+        secure_event_input: (keyboard_input_flags & 1) != 0,
+    })
+}
+
+/// Parsed Apple `DeviceInfo` (0x456) rectangle payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppleDeviceInfo {
+    pub structure_version: u32,
+    pub enclosure_rgb_color: u32,
+    pub device_identifier: String,
+    pub device_color: String,
+    pub enclosure_color: String,
+    pub housing_color: i32,
+}
+
+/// Parse an Apple `DeviceInfo` (`0x456`) rectangle payload.
+///
+/// Returns `None` if the payload is too short or malformed.
+fn parse_apple_device_info(payload: &[u8]) -> Option<AppleDeviceInfo> {
+    if payload.len() < 12 {
+        return None;
+    }
+    let _block_pair_count = u16::from_be_bytes([payload[0], payload[1]]);
+    let structure_version = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
+    let enclosure_rgb_color = u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]]);
+    let identifier_len = u16::from_be_bytes([payload[10], payload[11]]) as usize;
+    let color_len = u16::from_be_bytes([payload[12], payload[13]]) as usize;
+    let enclosure_len = u16::from_be_bytes([payload[14], payload[15]]) as usize;
+
+    let mut off = 16usize;
+    let read_string = |len: usize, off: &mut usize| -> Option<String> {
+        if *off + len > payload.len() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&payload[*off..*off + len])
+            .trim_end_matches('\0')
+            .to_string();
+        *off += len;
+        Some(s)
+    };
+
+    let device_identifier = read_string(identifier_len, &mut off)?;
+    let device_color = read_string(color_len, &mut off)?;
+    let enclosure_color = read_string(enclosure_len, &mut off)?;
+
+    if off + 4 > payload.len() {
+        return None;
+    }
+    let housing_color = i32::from_be_bytes([
+        payload[off],
+        payload[off + 1],
+        payload[off + 2],
+        payload[off + 3],
+    ]);
+
+    Some(AppleDeviceInfo {
+        structure_version,
+        enclosure_rgb_color,
+        device_identifier,
+        device_color,
+        enclosure_color,
+        housing_color,
+    })
 }
 
 impl Default for VncClient {
@@ -2922,5 +3254,126 @@ mod tests {
     #[test]
     fn parse_apple_display_layout_rejects_short_payload() {
         assert!(parse_apple_display_layout(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn parse_apple_keyboard_input_source_extracts_fields() {
+        let id = "com.apple.keylayout.ABC";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_be_bytes()); // version_marker
+        payload.extend_from_slice(&1u32.to_be_bytes()); // keyboard_input_flags
+        payload.extend_from_slice(&(id.len() as u16).to_be_bytes()); // id_len
+        payload.extend_from_slice(id.as_bytes());
+
+        let info = parse_apple_keyboard_input_source(&payload).unwrap();
+        assert_eq!(info.version_marker, 1);
+        assert_eq!(info.keyboard_input_flags, 1);
+        assert_eq!(info.input_source_id, id);
+        assert!(info.secure_event_input);
+    }
+
+    #[test]
+    fn parse_apple_keyboard_input_source_rejects_short_payload() {
+        assert!(parse_apple_keyboard_input_source(&[0u8; 6]).is_none());
+        // id_len exceeds payload
+        let mut payload = vec![0u8; 8];
+        payload[6..8].copy_from_slice(&10u16.to_be_bytes());
+        assert!(parse_apple_keyboard_input_source(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_apple_device_info_extracts_fields() {
+        let identifier = "MacBookPro18,1";
+        let color = "Silver";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_be_bytes()); // block_pair_count
+        payload.extend_from_slice(&1u32.to_be_bytes()); // structure_version
+        payload.extend_from_slice(&0x12345678u32.to_be_bytes()); // enclosure_rgb_color
+        payload.extend_from_slice(&((identifier.len() + 1) as u16).to_be_bytes()); // device_identifier_len
+        payload.extend_from_slice(&((color.len() + 1) as u16).to_be_bytes()); // device_color_len
+        payload.extend_from_slice(&((color.len() + 1) as u16).to_be_bytes()); // enclosure_color_len
+        payload.extend_from_slice(identifier.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(color.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(color.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&42i32.to_be_bytes()); // housing_color
+
+        let info = parse_apple_device_info(&payload).unwrap();
+        assert_eq!(info.structure_version, 1);
+        assert_eq!(info.enclosure_rgb_color, 0x12345678);
+        assert_eq!(info.device_identifier, identifier);
+        assert_eq!(info.device_color, color);
+        assert_eq!(info.enclosure_color, color);
+        assert_eq!(info.housing_color, 42);
+    }
+
+    #[test]
+    fn parse_apple_device_info_rejects_short_payload() {
+        assert!(parse_apple_device_info(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn hp_send_methods_require_connection() {
+        let mut client = VncClientBuilder::new().high_performance(true).build();
+        assert!(matches!(
+            client.send_hp_key_event(true, 0x61, 0, 0),
+            Err(VncError::NotConnected)
+        ));
+        assert!(matches!(
+            client.send_hp_pointer_event(0, 0, 0),
+            Err(VncError::NotConnected)
+        ));
+        assert!(matches!(
+            client.send_hp_set_mode(1),
+            Err(VncError::NotConnected)
+        ));
+        assert!(matches!(
+            client.send_hp_scale_factor(2.0),
+            Err(VncError::NotConnected)
+        ));
+        assert!(matches!(
+            client.send_hp_set_display_message(true, 0),
+            Err(VncError::NotConnected)
+        ));
+        assert!(matches!(
+            client.send_hp_auto_pasteboard(1),
+            Err(VncError::NotConnected)
+        ));
+        assert!(matches!(
+            client.send_hp_set_keyboard_input_source("com.apple.keylayout.ABC"),
+            Err(VncError::NotConnected)
+        ));
+        assert!(matches!(
+            client.request_clipboard_fetch(),
+            Err(VncError::NotConnected)
+        ));
+    }
+
+    #[test]
+    fn hp_scale_factor_rejects_non_positive() {
+        let mut client = VncClientBuilder::new().high_performance(true).build();
+        assert!(matches!(
+            client.send_hp_scale_factor(0.0),
+            Err(VncError::Protocol(_))
+        ));
+        assert!(matches!(
+            client.send_hp_scale_factor(-1.0),
+            Err(VncError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn hp_auto_pasteboard_rejects_invalid_selector() {
+        let mut client = VncClientBuilder::new().high_performance(true).build();
+        assert!(matches!(
+            client.send_hp_auto_pasteboard(0),
+            Err(VncError::Protocol(_))
+        ));
+        assert!(matches!(
+            client.send_hp_auto_pasteboard(3),
+            Err(VncError::Protocol(_))
+        ));
     }
 }

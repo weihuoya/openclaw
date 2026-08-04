@@ -51,6 +51,9 @@ pub struct AppleRecordLayer<S: Read + Write = TcpStream> {
     enc_seq: u32,
     dec_seq: u32,
     wrap_key: [u8; BLOCK_LEN],
+    /// Current AES-128 content key used for CBC records and for ECB-encrypting
+    /// Apple HP `EncryptedInputEvent` (0x10) messages.
+    content_key: [u8; BLOCK_LEN],
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
 }
@@ -94,6 +97,7 @@ impl<S: Read + Write> AppleRecordLayer<S> {
         self.enc_iv = iv;
         self.dec_iv = iv;
         self.wrap_key = key;
+        self.content_key = key;
         Ok(())
     }
 
@@ -109,6 +113,7 @@ impl<S: Read + Write> AppleRecordLayer<S> {
             enc_seq: 0,
             dec_seq: 0,
             wrap_key,
+            content_key: key,
             read_buf: Vec::new(),
             write_buf: Vec::new(),
         }
@@ -178,6 +183,18 @@ impl<S: Read + Write> AppleRecordLayer<S> {
         hasher.finalize().into()
     }
 
+    /// Encrypt a 16-byte input-event block with the current content key using
+    /// AES-128-ECB. This is used for Apple HP `EncryptedInputEvent` (0x10)
+    /// messages; the whole 16-byte plaintext is encrypted in place as one block.
+    fn encrypt_input_block(&self, plaintext: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
+        let cipher = Aes128::new_from_slice(&self.content_key).expect("valid AES-128 key");
+        let mut block = Block::<Aes128>::clone_from_slice(plaintext);
+        cipher.encrypt_block(&mut block);
+        let mut out = [0u8; BLOCK_LEN];
+        out.copy_from_slice(&block);
+        out
+    }
+
     fn write_record(&mut self, body: &[u8]) -> io::Result<()> {
         let pad_len = (BLOCK_LEN - ((2 + body.len() + MAC_LEN) % BLOCK_LEN)) % BLOCK_LEN;
         let body_with_len_and_pad_len = 2 + body.len() + pad_len;
@@ -238,6 +255,56 @@ impl<S: Read + Write> AppleRecordLayer<S> {
             ));
         }
         Ok(body_with_mac[2..2 + body_len].to_vec())
+    }
+
+    /// Build an encrypted Apple HP key-event message (0x10, subtype 1).
+    ///
+    /// The 16-byte plaintext block is AES-128-ECB-encrypted in place with the
+    /// current record-layer content key. `key_type` and `key_code` are the Apple
+    /// keyboard-type and local-keycode fields; callers that do not have them can
+    /// pass `0`.
+    pub fn build_encrypted_key_event(
+        &self,
+        down: bool,
+        keysym: u32,
+        key_type: u16,
+        key_code: u16,
+    ) -> Vec<u8> {
+        let mut plain = [0u8; BLOCK_LEN];
+        plain[0] = 0;
+        plain[1] = if down { 1 } else { 0 };
+        plain[2..6].copy_from_slice(&keysym.to_be_bytes());
+        // bytes 6..9 event_delta left as zero
+        // bytes 10..11 unknown_zero left as zero
+        plain[12..14].copy_from_slice(&key_type.to_be_bytes());
+        plain[14..16].copy_from_slice(&key_code.to_be_bytes());
+
+        let mut msg = Vec::with_capacity(18);
+        msg.push(protocol::apple::ENCRYPTED_INPUT_EVENT);
+        msg.push(0x01); // subtype 1 = legacy encrypted key event
+        msg.extend_from_slice(&self.encrypt_input_block(&plain));
+        msg
+    }
+
+    /// Build an encrypted Apple HP pointer-event message (0x10, subtype 3).
+    ///
+    /// The 16-byte plaintext block is AES-128-ECB-encrypted in place with the
+    /// current record-layer content key. `button_mask` must be in the Apple HP
+    /// wire format (right/middle bits swapped relative to RFC 6143).
+    pub fn build_encrypted_pointer_event(&self, button_mask: u8, x: u16, y: u16) -> Vec<u8> {
+        let mut plain = [0u8; BLOCK_LEN];
+        // bytes 0..5 zero for ordinary move events
+        // bytes 6..9 event_delta left as zero
+        plain[10] = 0xff; // event marker
+        plain[11] = button_mask;
+        plain[12..14].copy_from_slice(&x.to_be_bytes());
+        plain[14..16].copy_from_slice(&y.to_be_bytes());
+
+        let mut msg = Vec::with_capacity(18);
+        msg.push(protocol::apple::ENCRYPTED_INPUT_EVENT);
+        msg.push(0x03); // subtype 3 = legacy encrypted mouse event
+        msg.extend_from_slice(&self.encrypt_input_block(&plain));
+        msg
     }
 }
 
@@ -389,6 +456,82 @@ pub fn build_auto_framebuffer_update(
     msg.extend_from_slice(&w.to_be_bytes());
     msg.extend_from_slice(&h.to_be_bytes());
     msg
+}
+
+/// Build a `SetMode` (0x0a) message.
+///
+/// `mode` = 0 for observe-only, 1 for normal control. Native Screen Sharing.app
+/// sends `mode = 1`; the reference client omits this optional message.
+pub fn build_set_mode(mode: u16) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(4);
+    msg.push(protocol::apple::SET_MODE);
+    msg.push(0x00);
+    msg.extend_from_slice(&mode.to_be_bytes());
+    msg
+}
+
+/// Build a `ScaleFactor` (0x08) message.
+///
+/// The server derives an internal downscaling flag from `scale < 1.0`. The value
+/// must be positive.
+pub fn build_scale_factor(scale: f64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(10);
+    msg.push(protocol::apple::SCALE_FACTOR);
+    msg.push(0x00);
+    msg.extend_from_slice(&scale.to_be_bytes());
+    msg
+}
+
+/// Build a `SetDisplayMessage` (0x0d) message.
+///
+/// When `combine_all_displays` is true, `display_id` is ignored and the server
+/// selects the combined-display aggregate.
+pub fn build_set_display_message(combine_all_displays: bool, display_id: u32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8);
+    msg.push(protocol::apple::SET_DISPLAY_MESSAGE);
+    msg.push(if combine_all_displays { 1 } else { 0 });
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&display_id.to_be_bytes());
+    msg
+}
+
+/// Build an `AutoPasteboard` (0x15) message.
+///
+/// `selector` = 1 starts local-pasteboard monitoring (universal-clipboard sync);
+/// `selector` = 2 stops it. Only values 1 and 2 are accepted by the server.
+pub fn build_auto_pasteboard(selector: u8) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8);
+    msg.push(protocol::apple::AUTO_PASTEBOARD);
+    msg.extend_from_slice(&[0u8; 3]);
+    msg.push(selector);
+    msg.extend_from_slice(&[0u8; 3]);
+    msg
+}
+
+/// Build a `SetKeyboardInputSource` (0x1a) message.
+///
+/// Carries the keyboard input-source identifier (e.g.
+/// `"com.apple.keylayout.ABC"`) to the server agent. The string is truncated to
+/// `u16::MAX` bytes if necessary.
+pub fn build_set_keyboard_input_source(source_id: &str) -> Vec<u8> {
+    let id_bytes = source_id.as_bytes();
+    let id_len = id_bytes.len().min(u16::MAX as usize) as u16;
+    let size = 4 + id_len as usize; // message_version + id_len + source_id
+    let mut msg = Vec::with_capacity(3 + size);
+    msg.push(protocol::apple::SET_KEYBOARD_INPUT_SOURCE);
+    msg.extend_from_slice(&(size as u16).to_be_bytes());
+    msg.extend_from_slice(&1u16.to_be_bytes()); // message_version
+    msg.extend_from_slice(&id_len.to_be_bytes());
+    msg.extend_from_slice(&id_bytes[..id_len as usize]);
+    msg
+}
+
+/// Build a `ClipboardFetch` (0x0b) message.
+///
+/// Sent by the viewer after a `MiscStatus` (0x14) `cmd = 2` to pull the updated
+/// remote pasteboard.
+pub fn build_clipboard_fetch() -> Vec<u8> {
+    vec![protocol::apple::CLIPBOARD_FETCH]
 }
 
 /// Native mode-table template used by macOS Screen Sharing.app.
@@ -716,5 +859,112 @@ mod tests {
             ]),
             720
         );
+    }
+
+    #[test]
+    fn content_key_tracks_rekey() {
+        let mut layer = test_layer();
+        assert_eq!(layer.content_key, [1u8; 16]);
+        let mut rekey = vec![0u8; 36];
+        rekey[4..20].copy_from_slice(&[3u8; 16]);
+        rekey[20..36].copy_from_slice(&[4u8; 16]);
+        layer.rekey(&rekey).unwrap();
+        // After rekey, the content key should be the unwrapped new key.
+        assert_ne!(layer.content_key, [1u8; 16]);
+    }
+
+    #[test]
+    fn encrypted_key_event_format() {
+        let layer = test_layer();
+        let msg = layer.build_encrypted_key_event(true, 0x61, 0, 0);
+        assert_eq!(msg.len(), 18);
+        assert_eq!(msg[0], protocol::apple::ENCRYPTED_INPUT_EVENT);
+        assert_eq!(msg[1], 0x01); // subtype 1
+
+        // Decrypt the 16-byte block with the content key (ECB).
+        let cipher = Aes128::new_from_slice(&layer.content_key).unwrap();
+        let mut block = Block::<Aes128>::clone_from_slice(&msg[2..18]);
+        cipher.decrypt_block(&mut block);
+        assert_eq!(block[0], 0);
+        assert_eq!(block[1], 1); // down
+        assert_eq!(
+            u32::from_be_bytes([block[2], block[3], block[4], block[5]]),
+            0x61
+        );
+        // bytes 6..11 left as zero, key_type and key_code zero.
+        assert_eq!(u16::from_be_bytes([block[12], block[13]]), 0);
+        assert_eq!(u16::from_be_bytes([block[14], block[15]]), 0);
+    }
+
+    #[test]
+    fn encrypted_pointer_event_format() {
+        let layer = test_layer();
+        let msg = layer.build_encrypted_pointer_event(0x05, 100, 200);
+        assert_eq!(msg.len(), 18);
+        assert_eq!(msg[0], protocol::apple::ENCRYPTED_INPUT_EVENT);
+        assert_eq!(msg[1], 0x03); // subtype 3
+
+        let cipher = Aes128::new_from_slice(&layer.content_key).unwrap();
+        let mut block = Block::<Aes128>::clone_from_slice(&msg[2..18]);
+        cipher.decrypt_block(&mut block);
+        assert_eq!(block[10], 0xff); // event marker
+        assert_eq!(block[11], 0x05); // button mask
+        assert_eq!(u16::from_be_bytes([block[12], block[13]]), 100);
+        assert_eq!(u16::from_be_bytes([block[14], block[15]]), 200);
+    }
+
+    #[test]
+    fn set_mode_format() {
+        let msg = build_set_mode(1);
+        assert_eq!(msg.len(), 4);
+        assert_eq!(msg[0], protocol::apple::SET_MODE);
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 1);
+    }
+
+    #[test]
+    fn scale_factor_format() {
+        let msg = build_scale_factor(2.0);
+        assert_eq!(msg.len(), 10);
+        assert_eq!(msg[0], protocol::apple::SCALE_FACTOR);
+        assert_eq!(f64::from_be_bytes(msg[2..10].try_into().unwrap()), 2.0);
+    }
+
+    #[test]
+    fn set_display_message_format() {
+        let msg = build_set_display_message(true, 0x12345678);
+        assert_eq!(msg.len(), 8);
+        assert_eq!(msg[0], protocol::apple::SET_DISPLAY_MESSAGE);
+        assert_eq!(msg[1], 1);
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 0);
+        assert_eq!(
+            u32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]),
+            0x12345678
+        );
+    }
+
+    #[test]
+    fn auto_pasteboard_format() {
+        let msg = build_auto_pasteboard(1);
+        assert_eq!(msg.len(), 8);
+        assert_eq!(msg[0], protocol::apple::AUTO_PASTEBOARD);
+        assert_eq!(msg[4], 1);
+    }
+
+    #[test]
+    fn set_keyboard_input_source_format() {
+        let msg = build_set_keyboard_input_source("com.apple.keylayout.ABC");
+        assert_eq!(msg[0], protocol::apple::SET_KEYBOARD_INPUT_SOURCE);
+        let size = u16::from_be_bytes([msg[1], msg[2]]) as usize;
+        assert_eq!(msg.len(), 3 + size);
+        assert_eq!(u16::from_be_bytes([msg[3], msg[4]]), 1); // message_version
+        assert_eq!(u16::from_be_bytes([msg[5], msg[6]]), 23); // id_len
+        assert_eq!(&msg[7..], b"com.apple.keylayout.ABC");
+    }
+
+    #[test]
+    fn clipboard_fetch_format() {
+        let msg = build_clipboard_fetch();
+        assert_eq!(msg.len(), 1);
+        assert_eq!(msg[0], protocol::apple::CLIPBOARD_FETCH);
     }
 }

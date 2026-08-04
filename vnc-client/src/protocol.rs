@@ -42,9 +42,14 @@ pub mod apple {
     pub const MEDIA_STREAM_OPTIONS: u8 = 0x1c;
     pub const SET_KEYBOARD_INPUT_SOURCE: u8 = 0x1a;
     pub const SET_DISPLAY_MESSAGE: u8 = 0x0d;
+    pub const SCALE_FACTOR: u8 = 0x08;
+    pub const ENCRYPTED_INPUT_EVENT: u8 = 0x10;
+    pub const AUTO_PASTEBOARD: u8 = 0x15;
+    pub const CLIPBOARD_FETCH: u8 = 0x0b;
 
     // Apple server-to-client control message opcodes.
     pub const MISC_STATUS: u8 = 0x14;
+    pub const CLIPBOARD_SEND: u8 = 0x1f;
 
     // Apple security types.
     pub const SECURITY_DH: u8 = 30;
