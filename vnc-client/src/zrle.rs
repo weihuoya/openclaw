@@ -1,14 +1,20 @@
+//! ZRLE (Zlib Run-Length Encoding) decoder, encoding type 16.
+//!
+//! ZRLE rectangles are zlib-compressed streams of 64x64 tiles. The tile format
+//! is identical to TRLE (encoding 15); the shared tile decoder lives in
+//! [`vnc_protocol::zrle::decode_tiles`], and the persistent zlib session
+//! decompressor in [`vnc_protocol::zlib::SessionInflate`]. This module only
+//! wires the two together.
+
 use std::io::{Cursor, Read};
 
-use flate2::{Decompress, FlushDecompress, Status};
+use vnc_protocol::zlib::{self, SessionInflate};
+use vnc_protocol::zrle::TILE_SIZE;
 
 use crate::framebuffer::{Framebuffer, PixelFormat};
 use crate::VncError;
 
-const TILE_WIDTH: usize = 64;
-const TILE_HEIGHT: usize = 64;
-
-/// Decode ZRLE-encoded rectangle from the stream into the framebuffer.
+/// Decode a ZRLE-encoded rectangle from the stream into the framebuffer.
 ///
 /// `decompress` is maintained across rectangles to support servers that keep a
 /// single zlib stream open for the whole session (e.g. wayvnc/neatvnc). It is
@@ -16,7 +22,7 @@ const TILE_HEIGHT: usize = 64;
 #[allow(clippy::too_many_arguments)]
 pub fn decode<R: Read>(
     stream: &mut R,
-    decompress: &mut Option<Decompress>,
+    decompress: &mut Option<SessionInflate>,
     fb: &mut Framebuffer,
     rect_x: usize,
     rect_y: usize,
@@ -24,44 +30,37 @@ pub fn decode<R: Read>(
     rect_h: usize,
     pixel_format: &PixelFormat,
 ) -> Result<(), VncError> {
-    let bpp = pixel_format.bytes_per_cpixel();
-
-    // Read compressed length (big-endian u32)
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let compressed_len = u32::from_be_bytes(len_buf) as usize;
-
-    // Read compressed data
-    let mut compressed = vec![0u8; compressed_len];
-    stream.read_exact(&mut compressed)?;
+    let compressed = zlib::read_len_prefixed(stream, zlib::MAX_COMPRESSED_LEN)?;
 
     // Some servers (e.g. wayvnc) use a single zlib stream for all ZRLE
     // rectangles; others start a new zlib stream per rectangle. Reset the
     // decompressor whenever we see a fresh zlib header.
-    if is_zlib_header(&compressed) {
+    if zlib::is_zlib_header(&compressed) {
         log::debug!("ZRLE detected fresh zlib header, resetting decompressor");
-        *decompress = Some(Decompress::new(true));
+        *decompress = Some(SessionInflate::new());
     }
 
-    let decompressor = decompress
+    let session = decompress
         .as_mut()
         .ok_or_else(|| VncError::Protocol("ZRLE decompressor not initialized".to_string()))?;
 
-    let data = decompress_chunk(&compressed, decompressor, rect_w * rect_h * bpp)?;
+    let bpp = pixel_format.bytes_per_cpixel();
+    let tile_count = rect_w.div_ceil(TILE_SIZE) * rect_h.div_ceil(TILE_SIZE);
+    let max_output = rect_w * rect_h * (bpp + 1) + tile_count + 64;
+    // `min_out` stays 0: a truncated tile stream is reported by
+    // `decode_tiles` as an IO error, preserving the historical error variant.
+    let data = session.feed(&compressed, 0, max_output)?;
     let mut cursor = Cursor::new(&data);
 
-    let tiles_x = rect_w.div_ceil(TILE_WIDTH);
-    let tiles_y = rect_h.div_ceil(TILE_HEIGHT);
-
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let x = rect_x + tx * TILE_WIDTH;
-            let y = rect_y + ty * TILE_HEIGHT;
-            let w = TILE_WIDTH.min(rect_w - tx * TILE_WIDTH);
-            let h = TILE_HEIGHT.min(rect_h - ty * TILE_HEIGHT);
-            decode_tile(&mut cursor, fb, x, y, w, h, pixel_format, bpp)?;
-        }
-    }
+    vnc_protocol::zrle::decode_tiles(
+        &mut cursor,
+        fb,
+        rect_x,
+        rect_y,
+        rect_w,
+        rect_h,
+        pixel_format,
+    )?;
 
     let consumed = cursor.position() as usize;
     let remaining = data.len().saturating_sub(consumed);
@@ -79,376 +78,6 @@ pub fn decode<R: Read>(
     Ok(())
 }
 
-/// Returns true if the data starts with a valid zlib header.
-fn is_zlib_header(compressed: &[u8]) -> bool {
-    if compressed.len() < 2 {
-        return false;
-    }
-    let cmf = compressed[0];
-    let flg = compressed[1];
-    // Deflate compression (CM == 8) and the header check bits must be valid.
-    (cmf & 0x0f) == 8 && ((cmf as u16) * 256 + (flg as u16)).is_multiple_of(31)
-}
-
-/// Decompress one ZRLE rectangle using a continuous zlib stream.
-///
-/// The output buffer is grown as needed. Returns the decompressed bytes.
-fn decompress_chunk(
-    compressed: &[u8],
-    decompress: &mut Decompress,
-    min_output: usize,
-) -> Result<Vec<u8>, VncError> {
-    let mut output = Vec::with_capacity(min_output.max(compressed.len() * 4));
-    let mut input_offset = 0;
-    let mut iteration = 0;
-
-    loop {
-        iteration += 1;
-
-        // Ensure we have spare capacity for the next pass.
-        let spare = output.capacity() - output.len();
-        if spare < 4096 {
-            output.reserve(4096.max(min_output - output.len()));
-        }
-
-        let total_in_before = decompress.total_in();
-        let status = decompress
-            .decompress_vec(
-                &compressed[input_offset..],
-                &mut output,
-                FlushDecompress::Sync,
-            )
-            .map_err(|e| VncError::Protocol(format!("ZRLE decompress error: {}", e)))?;
-        let consumed = (decompress.total_in() - total_in_before) as usize;
-        input_offset += consumed;
-        if input_offset == compressed.len() {
-            // Some zlib data may still be buffered inside the decompressor after
-            // the last input chunk has been consumed. Keep flushing with empty input
-            // until no more output is produced. This is needed for wayvnc's
-            // continuous zlib stream, where the stream boundary is not aligned with a
-            // deflate flush marker and the stream does not end with this rectangle.
-            let mut prev_len = output.len();
-            loop {
-                let spare = output.capacity() - output.len();
-                if spare < 4096 {
-                    output.reserve(4096);
-                }
-                let _ = decompress.decompress_vec(&[], &mut output, FlushDecompress::Sync);
-                if output.len() == prev_len {
-                    break;
-                }
-                prev_len = output.len();
-            }
-            break;
-        }
-
-        if consumed == 0 && status == Status::Ok {
-            // More output space is needed.
-            continue;
-        }
-
-        let remaining = &compressed[input_offset..];
-        log::error!(
-            "ZRLE decompress stall: iter={} total_in={}/{} consumed_this_iter={} status={:?} \
-             output_len={} min_output={} remaining_bytes={} remaining_hex={:02x?} \
-             compressed_prefix={:02x?} compressed_suffix={:02x?}",
-            iteration,
-            input_offset,
-            compressed.len(),
-            consumed,
-            status,
-            output.len(),
-            min_output,
-            remaining.len(),
-            &remaining[..remaining.len().min(16)],
-            &compressed[..compressed.len().min(16)],
-            &compressed[compressed.len().saturating_sub(16)..]
-        );
-        return Err(VncError::Protocol(format!(
-            "ZRLE decompress stalled: consumed {} of {} bytes, status {:?}",
-            input_offset,
-            compressed.len(),
-            status
-        )));
-    }
-
-    Ok(output)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_tile<R: Read>(
-    cursor: &mut R,
-    fb: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    pixel_format: &PixelFormat,
-    bpp: usize,
-) -> Result<(), VncError> {
-    let mut subencoding = [0u8; 1];
-    cursor.read_exact(&mut subencoding)?;
-
-    match subencoding[0] {
-        0 => decode_raw_tile(cursor, fb, x, y, w, h, pixel_format, bpp),
-        1 => decode_solid_tile(cursor, fb, x, y, w, h, pixel_format, bpp),
-        2..=127 => decode_palette_tile(
-            cursor,
-            fb,
-            x,
-            y,
-            w,
-            h,
-            pixel_format,
-            bpp,
-            subencoding[0] as usize,
-        ),
-        128 => decode_plain_rle_tile(cursor, fb, x, y, w, h, pixel_format, bpp),
-        129 => Err(VncError::Protocol(
-            "ZRLE subencoding 129 is reserved".to_string(),
-        )),
-        130..=255 => decode_palette_rle_tile(
-            cursor,
-            fb,
-            x,
-            y,
-            w,
-            h,
-            pixel_format,
-            bpp,
-            subencoding[0] as usize - 128,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_raw_tile<R: Read>(
-    cursor: &mut R,
-    fb: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    pixel_format: &PixelFormat,
-    bpp: usize,
-) -> Result<(), VncError> {
-    // ZRLE raw tiles use CPIXELs. write_region expects PIXEL-sized bytes, so we
-    // convert each CPIXEL to RGBA and write it directly.
-    let mut pixel = vec![0u8; bpp];
-    for row in 0..h {
-        for col in 0..w {
-            cursor.read_exact(&mut pixel)?;
-            let rgba = pixel_format.to_rgba(&pixel);
-            fb.write_pixel(x + col, y + row, rgba);
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_solid_tile<R: Read>(
-    cursor: &mut R,
-    fb: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    pixel_format: &PixelFormat,
-    bpp: usize,
-) -> Result<(), VncError> {
-    let mut pixel = vec![0u8; bpp];
-    cursor.read_exact(&mut pixel)?;
-    let rgba = pixel_format.to_rgba(&pixel);
-
-    for row in 0..h {
-        for col in 0..w {
-            fb.write_pixel(x + col, y + row, rgba);
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_palette_tile<R: Read>(
-    cursor: &mut R,
-    fb: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    pixel_format: &PixelFormat,
-    bpp: usize,
-    palette_size: usize,
-) -> Result<(), VncError> {
-    // Read palette
-    let mut palette = vec![vec![0u8; bpp]; palette_size];
-    for entry in &mut palette {
-        cursor.read_exact(entry)?;
-    }
-
-    // Convert palette entries to RGBA once
-    let palette_rgba: Vec<[u8; 4]> = palette
-        .iter()
-        .map(|entry| pixel_format.to_rgba(entry))
-        .collect();
-
-    // Determine bits per index based on palette size
-    let bits_per_index = match palette_size {
-        2 => 1,
-        3..=4 => 2,
-        5..=16 => 4,
-        17..=128 => 8,
-        _ => {
-            return Err(VncError::Protocol(format!(
-                "Invalid ZRLE palette size: {}",
-                palette_size
-            )))
-        }
-    };
-
-    let pixels_per_byte = 8 / bits_per_index;
-    let row_bytes = w.div_ceil(pixels_per_byte);
-
-    for row in 0..h {
-        let mut row_data = vec![0u8; row_bytes];
-        cursor.read_exact(&mut row_data)?;
-
-        for col in 0..w {
-            let byte_idx = col / pixels_per_byte;
-            let bit_offset = 8 - bits_per_index - (col % pixels_per_byte) * bits_per_index;
-            let mask = (1 << bits_per_index) - 1;
-            let index = ((row_data[byte_idx] >> bit_offset) & mask) as usize;
-
-            let rgba = if index < palette_size {
-                palette_rgba[index]
-            } else {
-                [0, 0, 0, 0xff]
-            };
-            fb.write_pixel(x + col, y + row, rgba);
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_plain_rle_tile<R: Read>(
-    cursor: &mut R,
-    fb: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    pixel_format: &PixelFormat,
-    bpp: usize,
-) -> Result<(), VncError> {
-    let mut pixels_remaining = w * h;
-    let mut current_x = x;
-    let mut current_y = y;
-
-    while pixels_remaining > 0 {
-        let mut pixel = vec![0u8; bpp];
-        cursor.read_exact(&mut pixel)?;
-        let rgba = pixel_format.to_rgba(&pixel);
-
-        let length = read_rle_length(cursor)?;
-        let length = length.min(pixels_remaining);
-        pixels_remaining -= length;
-
-        for _ in 0..length {
-            fb.write_pixel(current_x, current_y, rgba);
-            current_x += 1;
-            if current_x >= x + w {
-                current_x = x;
-                current_y += 1;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_palette_rle_tile<R: Read>(
-    cursor: &mut R,
-    fb: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    pixel_format: &PixelFormat,
-    bpp: usize,
-    palette_size: usize,
-) -> Result<(), VncError> {
-    // Read palette
-    let mut palette = vec![vec![0u8; bpp]; palette_size];
-    for entry in &mut palette {
-        cursor.read_exact(entry)?;
-    }
-
-    // Convert palette entries to RGBA once
-    let palette_rgba: Vec<[u8; 4]> = palette
-        .iter()
-        .map(|entry| pixel_format.to_rgba(entry))
-        .collect();
-
-    let mut pixels_remaining = w * h;
-    let mut current_x = x;
-    let mut current_y = y;
-
-    while pixels_remaining > 0 {
-        let mut index_buf = [0u8; 1];
-        cursor.read_exact(&mut index_buf)?;
-        let index_byte = index_buf[0];
-        let index = (index_byte & 0x7f) as usize;
-
-        let length = if index_byte & 0x80 != 0 {
-            read_rle_length(cursor)?
-        } else {
-            1
-        };
-
-        let length = length.min(pixels_remaining);
-        pixels_remaining -= length;
-
-        let rgba = if index < palette_size {
-            palette_rgba[index]
-        } else {
-            [0, 0, 0, 0xff]
-        };
-
-        for _ in 0..length {
-            fb.write_pixel(current_x, current_y, rgba);
-            current_x += 1;
-            if current_x >= x + w {
-                current_x = x;
-                current_y += 1;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Read an RLE run length as used by ZRLE plain RLE and palette RLE.
-///
-/// The run length is encoded as 1 plus the sum of one or more bytes. Each byte
-/// of 0xff adds 255 to the length; the final non-0xff byte is added directly.
-fn read_rle_length<R: Read>(cursor: &mut R) -> Result<usize, VncError> {
-    let mut length = 1usize;
-    loop {
-        let mut byte_buf = [0u8; 1];
-        cursor.read_exact(&mut byte_buf)?;
-        let byte = byte_buf[0] as usize;
-        length += byte;
-        if byte != 255 {
-            break;
-        }
-    }
-    Ok(length)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,10 +92,7 @@ mod tests {
     }
 
     fn build_zrle_payload(compressed: &[u8]) -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-        payload.extend_from_slice(compressed);
-        payload
+        zlib::len_prefixed(compressed)
     }
 
     #[test]
@@ -594,5 +220,119 @@ mod tests {
         assert_eq!(&fb.data()[4..8], &[0x00, 0xff, 0x00, 0xff]);
         assert_eq!(&fb.data()[8..12], &[0x00, 0x00, 0xff, 0xff]);
         assert_eq!(&fb.data()[12..16], &[0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn packed_palette_two_color_scanline_padding() {
+        // 5x2 tile, 2 colours -> 1 bit per pixel, each scanline padded to a
+        // whole byte. Row 0: R G R G R -> 0b01010xxx = 0x50.
+        // Row 1: G R G R G -> 0b10101xxx = 0xa8.
+        let fmt = PixelFormat::rgba32();
+        let red = [0xff, 0x00, 0x00];
+        let green = [0x00, 0xff, 0x00];
+
+        let mut tile = vec![2u8]; // packed palette, 2 colours
+        tile.extend_from_slice(&red);
+        tile.extend_from_slice(&green);
+        tile.push(0x50);
+        tile.push(0xa8);
+
+        let mut fb = Framebuffer::new(5, 2);
+        decode(
+            &mut Cursor::new(&build_zrle_payload(&compress(&tile))),
+            &mut None,
+            &mut fb,
+            0,
+            0,
+            5,
+            2,
+            &fmt,
+        )
+        .unwrap();
+
+        let r = [0xff, 0x00, 0x00, 0xff];
+        let g = [0x00, 0xff, 0x00, 0xff];
+        let expected = [r, g, r, g, r, g, r, g, r, g];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(&fb.data()[i * 4..i * 4 + 4], want, "pixel {}", i);
+        }
+    }
+
+    #[test]
+    fn plain_rle_run_length_continuation() {
+        // Run length 300 -> 299 = 255 + 44 -> [255, 44]; run length 20 -> [19].
+        let fmt = PixelFormat::rgba32();
+        let red = [0xff, 0x00, 0x00];
+        let green = [0x00, 0xff, 0x00];
+
+        let mut tile = vec![128u8]; // plain RLE
+        tile.extend_from_slice(&red);
+        tile.push(255);
+        tile.push(44);
+        tile.extend_from_slice(&green);
+        tile.push(19);
+
+        let mut fb = Framebuffer::new(64, 5); // 320 pixels
+        decode(
+            &mut Cursor::new(&build_zrle_payload(&compress(&tile))),
+            &mut None,
+            &mut fb,
+            0,
+            0,
+            64,
+            5,
+            &fmt,
+        )
+        .unwrap();
+
+        let r = [0xff, 0x00, 0x00, 0xff];
+        let g = [0x00, 0xff, 0x00, 0xff];
+        for i in 0..300 {
+            assert_eq!(&fb.data()[i * 4..i * 4 + 4], &r, "pixel {}", i);
+        }
+        for i in 300..320 {
+            assert_eq!(&fb.data()[i * 4..i * 4 + 4], &g, "pixel {}", i);
+        }
+    }
+
+    #[test]
+    fn invalid_subencoding_is_rejected() {
+        // Subencodings 17..=127 are invalid per the RFB spec.
+        let fmt = PixelFormat::rgba32();
+        let tile = vec![17u8];
+        let mut fb = Framebuffer::new(1, 1);
+        assert!(decode(
+            &mut Cursor::new(&build_zrle_payload(&compress(&tile))),
+            &mut None,
+            &mut fb,
+            0,
+            0,
+            1,
+            1,
+            &fmt,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decompression_bomb_is_rejected() {
+        // A 2x2 rectangle can legitimately decode to only a handful of bytes;
+        // data that inflates far beyond that must produce a clean error
+        // instead of an unbounded allocation (or a reserve underflow panic).
+        let fmt = PixelFormat::rgba32();
+        let bomb = vec![0u8; 100_000];
+        let mut fb = Framebuffer::new(2, 2);
+        let err = decode(
+            &mut Cursor::new(&build_zrle_payload(&compress(&bomb))),
+            &mut None,
+            &mut fb,
+            0,
+            0,
+            2,
+            2,
+            &fmt,
+        )
+        .expect_err("oversized decompressed output must be rejected");
+        assert!(matches!(err, VncError::Protocol(_)));
     }
 }

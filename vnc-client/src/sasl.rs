@@ -121,6 +121,16 @@ impl SaslAuth {
             let status = u32::from_be_bytes(buf);
             stream.read_exact(&mut buf)?;
             let data_len = u32::from_be_bytes(buf) as usize;
+            // SASL challenge/response messages are at most a few KiB for the
+            // mechanisms used here (PLAIN/SCRAM); 64 KiB is generous and
+            // stops a hostile server from forcing a giant allocation.
+            const MAX_SASL_DATA_LEN: usize = 64 * 1024;
+            if data_len > MAX_SASL_DATA_LEN {
+                return Err(VncError::Protocol(format!(
+                    "SASL message length {} exceeds limit",
+                    data_len
+                )));
+            }
             let mut data = vec![0u8; data_len];
             if data_len > 0 {
                 stream.read_exact(&mut data)?;

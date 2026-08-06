@@ -8,12 +8,12 @@ repository.workspace = true
 description = "A Rust VNC client library implementing the RFB protocol"
 
 [dependencies]
+vnc-protocol = { path = "../vnc-protocol", features = ["jpeg"] }
 thiserror = "2.0"
 log = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 des = "0.9"
 cipher = "0.5"
-jpeg-decoder = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "0.26"
 rsa = "0.9"
@@ -39,3 +39,9 @@ gstreamer-video = "0.23"
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media"] }
+
+[dev-dependencies]
+# Used only by tests/zrle_trle_server_roundtrip.rs to verify that the client
+# decoders accept the server encoders' output. No dependency cycle: vnc-server
+# does not depend on vnc-client.
+vnc-server = { path = "../vnc-server" }

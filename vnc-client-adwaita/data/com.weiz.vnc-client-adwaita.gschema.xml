@@ -41,5 +41,10 @@
       <summary>Scale to fit</summary>
       <description>Scale the remote desktop to fit the window.</description>
     </key>
+    <key name="connection-history" type="as">
+      <default>[]</default>
+      <summary>Recent VNC connections</summary>
+      <description>List of recently used VNC connection settings (host, port, username, auth method, TLS, encoding). Passwords are not stored.</description>
+    </key>
   </schema>
 </schemalist>

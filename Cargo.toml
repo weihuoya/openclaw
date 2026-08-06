@@ -1,5 +1,5 @@
 [workspace]
-members = ["vnc-client", "vnc-widget-gtk4", "vnc-client-android", "vnc-client-adwaita", "vnc-server"]
+members = ["vnc-protocol", "vnc-client", "vnc-widget-gtk4", "vnc-client-android", "vnc-client-adwaita", "vnc-server"]
 resolver = "2"
 
 [workspace.package]

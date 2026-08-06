@@ -65,6 +65,7 @@ use std::time::Duration;
 
 use crate::tls::TlsStream;
 
+pub mod apple;
 pub mod apple_dh;
 pub mod apple_record_layer;
 pub mod apple_srp;
@@ -93,12 +94,19 @@ use cursor::CursorShape;
 use decoder::DefaultDecoder;
 use encodings::Encoding;
 use flate2::read::ZlibDecoder;
-use flate2::Decompress;
 use framebuffer::Framebuffer;
+use vnc_protocol::rect::check_dimensions;
 
 pub use framebuffer::PixelFormat;
 pub use framebuffer::Transform;
 pub use stats::ConnectionStats;
+
+/// Maximum length of a single QEMU audio extension chunk.
+///
+/// Audio chunks carry a few milliseconds of samples; 16 MiB is ~40+ seconds
+/// of 48 kHz/16-bit stereo — far beyond any legitimate chunk — and stops a
+/// hostile server from forcing a giant allocation.
+const MAX_QEMU_AUDIO_LEN: usize = 16 * 1024 * 1024;
 
 enum VncStreamInner {
     Plain(TcpStream),
@@ -307,8 +315,10 @@ pub struct VncClient {
     sasl_username: String,
     sasl_password: String,
     server_security_types: Vec<u8>,
-    zrle_decompress: Option<Decompress>,
-    zlib_decompress: Option<Decompress>,
+    zrle_decompress: Option<zlib::SessionInflate>,
+    zlib_decompress: zlib::SessionInflate,
+    tight_streams: tight::TightStreams,
+    hextile_state: hextile::HextileState,
     stats_tracker: stats::ConnectionStatsTracker,
     /// Current read timeout, so handlers like Raw can temporarily extend it
     /// for large data reads and restore it afterwards.
@@ -358,21 +368,10 @@ enum ClientState {
 }
 
 /// A single monitor/screen in the desktop layout.
-#[derive(Debug, Clone, Copy)]
-pub struct Screen {
-    /// Screen identifier.
-    pub id: u32,
-    /// X offset in the desktop.
-    pub x: u16,
-    /// Y offset in the desktop.
-    pub y: u16,
-    /// Screen width in pixels.
-    pub width: u16,
-    /// Screen height in pixels.
-    pub height: u16,
-    /// Screen flags (e.g. primary, etc.).
-    pub flags: u32,
-}
+///
+/// Re-exported from the shared `vnc-protocol` crate; the wire layout is
+/// parsed and built by [`protocol::framing::Screen`].
+pub use protocol::framing::Screen;
 
 /// Events emitted by the VNC client.
 #[derive(Debug, Clone)]
@@ -453,6 +452,15 @@ pub enum VncError {
     Timeout,
 }
 
+impl From<vnc_protocol::ProtocolError> for VncError {
+    fn from(err: vnc_protocol::ProtocolError) -> Self {
+        match err {
+            vnc_protocol::ProtocolError::Io(io) => VncError::Io(io),
+            vnc_protocol::ProtocolError::Protocol(msg) => VncError::Protocol(msg),
+        }
+    }
+}
+
 impl VncClient {
     /// Create a new VNC client (not connected yet).
     pub fn new() -> Self {
@@ -472,7 +480,9 @@ impl VncClient {
             sasl_password: String::new(),
             server_security_types: Vec::new(),
             zrle_decompress: None,
-            zlib_decompress: None,
+            zlib_decompress: zlib::SessionInflate::new(),
+            tight_streams: tight::TightStreams::new(),
+            hextile_state: hextile::HextileState::new(),
             stats_tracker: stats::ConnectionStatsTracker::new(),
             read_timeout: None,
             last_msg_type: None,
@@ -579,20 +589,22 @@ impl VncClient {
 
     fn handshake_version(&mut self) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; protocol::handshake::RFB_VERSION_BANNER_LEN];
         stream.read_exact(&mut buf)?;
 
-        let version = String::from_utf8_lossy(&buf);
-        let version = version.trim_end();
-        if !version.starts_with("RFB ") {
-            return Err(VncError::Protocol(format!(
-                "Invalid protocol version string: {}",
-                version
-            )));
-        }
+        let version = String::from_utf8_lossy(&buf).trim_end().to_string();
+        let (major, minor) = match protocol::handshake::parse_rfb_version(&buf) {
+            Some(Ok(version)) => version,
+            Some(Err(_)) | None => {
+                return Err(VncError::Protocol(format!(
+                    "Invalid protocol version string: {}",
+                    version
+                )))
+            }
+        };
 
-        let our_version = match version {
-            "RFB 003.889" => {
+        let our_version = match (major, minor) {
+            (3, 889) => {
                 if self.high_performance {
                     protocol::apple::PROTOCOL_VERSION
                 } else {
@@ -601,10 +613,10 @@ impl VncClient {
                     b"RFB 003.008\n"
                 }
             }
-            "RFB 003.008" => b"RFB 003.008\n",
-            "RFB 003.007" => b"RFB 003.007\n",
-            "RFB 003.003" => b"RFB 003.003\n",
-            _ => return Err(VncError::UnsupportedVersion(version.to_string())),
+            (3, 8) => b"RFB 003.008\n",
+            (3, 7) => b"RFB 003.007\n",
+            (3, 3) => b"RFB 003.003\n",
+            _ => return Err(VncError::UnsupportedVersion(version)),
         };
 
         stream.write_all(our_version)?;
@@ -668,6 +680,71 @@ impl VncClient {
         Ok(())
     }
 
+    /// Upgrade the current Plain TCP stream to AES-CTR encryption using RSA-AES.
+    /// Used by direct security types 5/129 and by VeNCrypt RSA-AES sub-types.
+    fn upgrade_to_aes_ctr(&mut self, key_size: usize) -> Result<(), VncError> {
+        let (mut tcp, bytes_read, bytes_written) = match self.stream.take() {
+            Some(VncStream {
+                inner: VncStreamInner::Plain(tcp),
+                bytes_read,
+                bytes_written,
+            }) => (tcp, bytes_read, bytes_written),
+            Some(VncStream {
+                inner: VncStreamInner::Tls(_),
+                ..
+            }) => {
+                return Err(VncError::Protocol(
+                    "RSA-AES over TLS not supported".to_string(),
+                ));
+            }
+            Some(VncStream {
+                inner: VncStreamInner::Aes(_),
+                ..
+            }) => {
+                return Err(VncError::Protocol("Already AES encrypted".to_string()));
+            }
+            Some(VncStream {
+                inner: VncStreamInner::Ws(_),
+                ..
+            }) => {
+                return Err(VncError::Protocol(
+                    "WebSocket not supported for RSA-AES auth".to_string(),
+                ));
+            }
+            Some(VncStream {
+                inner: VncStreamInner::AppleHp(_),
+                ..
+            }) => {
+                return Err(VncError::Protocol(
+                    "Apple HP stream cannot use RSA-AES".to_string(),
+                ));
+            }
+            None => return Err(VncError::NotConnected),
+        };
+
+        let rsa_auth = match key_size {
+            16 => rsa_aes::RsaAesAuth::new_128(),
+            32 => rsa_aes::RsaAesAuth::new_256(),
+            _ => {
+                return Err(VncError::Protocol(format!(
+                    "Invalid AES key size for RSA-AES: {}",
+                    key_size
+                )));
+            }
+        };
+        let key = rsa_auth.authenticate(&mut tcp)?;
+        let mut aes = rsa_aes::AesCtrStream::new(tcp, &key)?;
+        // Both sides switch to AES-CTR immediately after the encrypted session
+        // key is sent; the security result is the first encrypted message.
+        rsa_aes::RsaAesAuth::read_security_result(&mut aes)?;
+        self.stream = Some(VncStream {
+            inner: VncStreamInner::Aes(Box::new(aes)),
+            bytes_read,
+            bytes_written,
+        });
+        Ok(())
+    }
+
     fn handshake_auth(&mut self, auth: &mut dyn AuthHandler) -> Result<(), VncError> {
         let selected = {
             let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
@@ -676,14 +753,10 @@ impl VncClient {
             let num_types = buf[0] as usize;
 
             if num_types == 0 {
-                let mut buf = [0u8; 4];
-                stream.read_exact(&mut buf)?;
-                let len = u32::from_be_bytes(buf) as usize;
-                let mut reason = vec![0u8; len];
-                stream.read_exact(&mut reason)?;
-                return Err(VncError::AuthFailed(
-                    String::from_utf8_lossy(&reason).to_string(),
-                ));
+                // A reason length over the cap maps to VncError::Protocol
+                // (not Io) via the ProtocolError conversion.
+                let reason = protocol::handshake::read_failure_reason(stream)?;
+                return Err(VncError::AuthFailed(reason));
             }
 
             let mut types = vec![0u8; num_types];
@@ -717,6 +790,12 @@ impl VncClient {
             protocol::SECURITY_VNC_AUTH => {
                 let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                 auth.authenticate_vnc(stream)?;
+            }
+            protocol::SECURITY_RSA_AES => {
+                self.upgrade_to_aes_ctr(16)?;
+            }
+            protocol::SECURITY_RSA_AES256 => {
+                self.upgrade_to_aes_ctr(32)?;
             }
             protocol::apple::SECURITY_DH => {
                 let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
@@ -791,104 +870,10 @@ impl VncClient {
                         }
                     }
                     vencrypt::VencryptResult::RsaAes => {
-                        let (mut tcp, bytes_read, bytes_written) = match self.stream.take() {
-                            Some(VncStream {
-                                inner: VncStreamInner::Plain(tcp),
-                                bytes_read,
-                                bytes_written,
-                            }) => (tcp, bytes_read, bytes_written),
-                            Some(VncStream {
-                                inner: VncStreamInner::Tls(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "RSA-AES over TLS not supported".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Aes(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Already AES encrypted".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Ws(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "WebSocket not supported for VeNCrypt auth".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::AppleHp(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Apple HP stream cannot use RSA-AES".to_string(),
-                                ));
-                            }
-                            None => return Err(VncError::NotConnected),
-                        };
-                        let rsa_auth = rsa_aes::RsaAesAuth::new_128();
-                        let key = rsa_auth.authenticate(&mut tcp)?;
-                        let aes = rsa_aes::AesCtrStream::new(tcp, &key)?;
-                        self.stream = Some(VncStream {
-                            inner: VncStreamInner::Aes(Box::new(aes)),
-                            bytes_read,
-                            bytes_written,
-                        });
+                        self.upgrade_to_aes_ctr(16)?;
                     }
                     vencrypt::VencryptResult::RsaAes256 => {
-                        let (mut tcp, bytes_read, bytes_written) = match self.stream.take() {
-                            Some(VncStream {
-                                inner: VncStreamInner::Plain(tcp),
-                                bytes_read,
-                                bytes_written,
-                            }) => (tcp, bytes_read, bytes_written),
-                            Some(VncStream {
-                                inner: VncStreamInner::Tls(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "RSA-AES-256 over TLS not supported".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Aes(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Already AES encrypted".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::Ws(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "WebSocket not supported for VeNCrypt auth".to_string(),
-                                ));
-                            }
-                            Some(VncStream {
-                                inner: VncStreamInner::AppleHp(_),
-                                ..
-                            }) => {
-                                return Err(VncError::Protocol(
-                                    "Apple HP stream cannot use RSA-AES-256".to_string(),
-                                ));
-                            }
-                            None => return Err(VncError::NotConnected),
-                        };
-                        let rsa_auth = rsa_aes::RsaAesAuth::new_256();
-                        let key = rsa_auth.authenticate(&mut tcp)?;
-                        let aes = rsa_aes::AesCtrStream::new(tcp, &key)?;
-                        self.stream = Some(VncStream {
-                            inner: VncStreamInner::Aes(Box::new(aes)),
-                            bytes_read,
-                            bytes_written,
-                        });
+                        self.upgrade_to_aes_ctr(32)?;
                     }
                     vencrypt::VencryptResult::AppleDh => {
                         // VeNCrypt Apple DH sub-type 30 is distinct from macOS Screen
@@ -923,8 +908,7 @@ impl VncClient {
     }
 
     fn initialization(&mut self, events: &mut Vec<VncEvent>) -> Result<(), VncError> {
-        let mut buf = [0u8; 24];
-        let name = {
+        let init = {
             let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
             // Send ClientInit (shared flag = true)
             log::debug!(
@@ -933,25 +917,16 @@ impl VncClient {
             );
             stream.write_all(&[self.client_init_shared])?;
             // Read ServerInit
-            stream.read_exact(&mut buf)?;
-
-            let name_len = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as usize;
-            log::debug!("ServerInit header: name_len = {}", name_len);
-            if name_len > 4096 {
-                return Err(VncError::Protocol(format!(
-                    "ServerInit name length too large: {}",
-                    name_len
-                )));
-            }
-            let mut name_buf = vec![0u8; name_len];
-            stream.read_exact(&mut name_buf)?;
-            String::from_utf8_lossy(&name_buf).to_string()
+            let init = protocol::ServerInit::read(stream)?;
+            log::debug!("ServerInit header: name_len = {}", init.name.len());
+            init
         };
 
-        self.width = u16::from_be_bytes([buf[0], buf[1]]);
-        self.height = u16::from_be_bytes([buf[2], buf[3]]);
-        self.pixel_format = PixelFormat::from_bytes(&buf[4..20])?;
-        self.name = name;
+        self.width = init.width;
+        self.height = init.height;
+        self.pixel_format = init.pixel_format;
+        self.name = init.name;
+        check_dimensions(self.width as u32, self.height as u32)?;
 
         log::debug!(
             "ServerInit: {}x{} name = {:?}",
@@ -1000,7 +975,7 @@ impl VncClient {
                     ))?;
                 }
                 log::debug!("Apple HP: sending initial SetEncodings");
-                stream.write_all(&apple_record_layer::build_set_encodings(
+                stream.write_all(&protocol::framing::build_set_encodings(
                     apple_record_layer::APPLE_HP_ENCODINGS,
                 ))?;
             }
@@ -1068,7 +1043,8 @@ impl VncClient {
     /// Read the initial plaintext rekey rectangle (encoding [`protocol::apple::ENC_REKEY`]) that the
     /// server emits during the Apple HP handshake. Tolerates a small amount of
     /// [`protocol::apple::MISC_STATUS`] traffic and Apple still-image codec
-    /// announcement rectangles (`1010`, `1011`) that can precede the rekey.
+    /// announcement rectangles ([`protocol::apple::ENC_MEDIA_STREAM`],
+    /// [`protocol::apple::ENC_MULTI_VARIANT_SCALED`]) that can precede the rekey.
     fn read_apple_initial_rekey_body(&mut self) -> Result<Vec<u8>, VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         loop {
@@ -1081,13 +1057,16 @@ impl VncClient {
                     let num_rects = u16::from_be_bytes([buf[1], buf[2]]);
                     let mut found_rekey: Option<Vec<u8>> = None;
                     for _ in 0..num_rects {
-                        let mut rect = [0u8; 12];
+                        let mut rect = [0u8; protocol::framing::RectHeader::WIRE_LEN];
                         stream.read_exact(&mut rect)?;
-                        let x = u16::from_be_bytes([rect[0], rect[1]]);
-                        let y = u16::from_be_bytes([rect[2], rect[3]]);
-                        let w = u16::from_be_bytes([rect[4], rect[5]]);
-                        let h = u16::from_be_bytes([rect[6], rect[7]]);
-                        let enc = i32::from_be_bytes([rect[8], rect[9], rect[10], rect[11]]);
+                        let header = protocol::framing::RectHeader::from_bytes(&rect);
+                        let (x, y, w, h, enc) = (
+                            header.x,
+                            header.y,
+                            header.width,
+                            header.height,
+                            header.encoding,
+                        );
 
                         if enc == protocol::apple::ENC_REKEY && x == 0 && y == 0 && w == 0 && h == 0
                         {
@@ -1099,7 +1078,9 @@ impl VncClient {
 
                         // Still-image codec announcement rectangles may precede the
                         // rekey; they carry a u16 length prefix and a payload.
-                        if enc == 1010 || enc == 1011 {
+                        if enc == protocol::apple::ENC_MEDIA_STREAM
+                            || enc == protocol::apple::ENC_MULTI_VARIANT_SCALED
+                        {
                             let mut len_buf = [0u8; 2];
                             stream.read_exact(&mut len_buf)?;
                             let len = u16::from_be_bytes(len_buf) as usize;
@@ -1144,10 +1125,7 @@ impl VncClient {
     /// Set the desired pixel format.
     pub fn set_pixel_format(&mut self, format: PixelFormat) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut msg = [0u8; 20];
-        msg[0] = 0; // SetPixelFormat
-                    // msg[1..4] padding (already zero)
-        format.write_to(&mut msg[4..20]);
+        let msg = protocol::framing::build_set_pixel_format(&format);
         log::debug!("Sending SetPixelFormat: {:?}", format);
         stream.write_all(&msg)?;
         self.pixel_format = format;
@@ -1170,13 +1148,8 @@ impl VncClient {
     /// ```
     pub fn set_encodings(&mut self, encodings: &[Encoding]) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut msg = Vec::with_capacity(4 + encodings.len() * 4);
-        msg.push(2); // SetEncodings
-        msg.push(0); // padding
-        msg.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
-        for enc in encodings {
-            msg.extend_from_slice(&enc.as_i32().to_be_bytes());
-        }
+        let raw: Vec<i32> = encodings.iter().map(|e| e.as_i32()).collect();
+        let msg = protocol::framing::build_set_encodings(&raw);
         log::debug!("Sending SetEncodings with {} encodings", encodings.len());
         stream.write_all(&msg)?;
         Ok(())
@@ -1204,13 +1177,14 @@ impl VncClient {
         height: u16,
     ) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut msg = [0u8; 10];
-        msg[0] = 3; // FramebufferUpdateRequest
-        msg[1] = if incremental { 1 } else { 0 };
-        msg[2..4].copy_from_slice(&x.to_be_bytes());
-        msg[4..6].copy_from_slice(&y.to_be_bytes());
-        msg[6..8].copy_from_slice(&width.to_be_bytes());
-        msg[8..10].copy_from_slice(&height.to_be_bytes());
+        let msg = protocol::framing::FramebufferUpdateRequest {
+            incremental,
+            x,
+            y,
+            width,
+            height,
+        }
+        .to_bytes();
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1237,14 +1211,7 @@ impl VncClient {
             button_mask
         };
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let msg = [
-            5u8, // PointerEvent
-            button_mask,
-            (x >> 8) as u8,
-            x as u8,
-            (y >> 8) as u8,
-            y as u8,
-        ];
+        let msg = protocol::framing::PointerEvent { button_mask, x, y }.to_bytes();
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1260,14 +1227,7 @@ impl VncClient {
         y: u16,
     ) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let msg = [
-            5u8, // PointerEvent
-            button_mask,
-            (x >> 8) as u8,
-            x as u8,
-            (y >> 8) as u8,
-            y as u8,
-        ];
+        let msg = protocol::framing::PointerEvent { button_mask, x, y }.to_bytes();
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1284,10 +1244,7 @@ impl VncClient {
     /// - ASCII characters use their literal code (e.g. `'a'` = 0x61)
     pub fn send_key_event(&mut self, down: bool, keysym: u32) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut msg = [0u8; 8];
-        msg[0] = 4; // KeyEvent
-        msg[1] = if down { 1 } else { 0 };
-        msg[4..8].copy_from_slice(&keysym.to_be_bytes());
+        let msg = protocol::framing::KeyEvent { down, keysym }.to_bytes();
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1421,13 +1378,14 @@ impl VncClient {
         height: u16,
     ) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut msg = [0u8; 10];
-        msg[0] = protocol::CLIENT_ENABLE_CONTINUOUS_UPDATES;
-        msg[1] = if enable { 1 } else { 0 };
-        msg[2..4].copy_from_slice(&x.to_be_bytes());
-        msg[4..6].copy_from_slice(&y.to_be_bytes());
-        msg[6..8].copy_from_slice(&width.to_be_bytes());
-        msg[8..10].copy_from_slice(&height.to_be_bytes());
+        let msg = protocol::framing::EnableContinuousUpdates {
+            enable,
+            x,
+            y,
+            width,
+            height,
+        }
+        .to_bytes();
         log::debug!(
             "Sending EnableContinuousUpdates enable={} {}x{}@({},{})",
             enable,
@@ -1441,13 +1399,22 @@ impl VncClient {
     }
 
     /// Send a fence request to the server.
+    ///
+    /// Wire format (RFB 7.6.7 ClientFence): message-type U8 (248), 3 bytes
+    /// padding, flags U32, length U8, then `length` payload bytes. The payload
+    /// is limited to 255 bytes by the U8 length field (the spec recommends a
+    /// maximum of 64 bytes).
     pub fn send_fence(&mut self, flags: u32, data: &[u8]) -> Result<(), VncError> {
+        if data.len() > u8::MAX as usize {
+            return Err(VncError::Protocol(format!(
+                "fence payload too long: {} bytes (max {})",
+                data.len(),
+                u8::MAX
+            )));
+        }
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         let mut msg = Vec::with_capacity(9 + data.len());
-        msg.push(protocol::CLIENT_FENCE); // ClientFence
-        msg.extend_from_slice(&flags.to_be_bytes());
-        msg.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        msg.extend_from_slice(data);
+        protocol::framing::Fence::write_message(&mut msg, flags, data);
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1461,10 +1428,7 @@ impl VncClient {
     fn send_cut_text_raw(&mut self, data: &[u8]) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         let mut msg = Vec::with_capacity(8 + data.len());
-        msg.push(6); // ClientCutText
-        msg.extend_from_slice(&[0, 0, 0]); // padding
-        msg.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        msg.extend_from_slice(data);
+        protocol::framing::write_cut_text(&mut msg, protocol::CLIENT_CUT_TEXT, data);
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1472,12 +1436,8 @@ impl VncClient {
     /// Send client cut text (legacy).
     pub fn send_cut_text(&mut self, text: &str) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let text_bytes = text.as_bytes();
-        let mut msg = Vec::with_capacity(8 + text_bytes.len());
-        msg.push(6); // ClientCutText
-        msg.extend_from_slice(&[0, 0, 0]); // padding
-        msg.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
-        msg.extend_from_slice(text_bytes);
+        let mut msg = Vec::with_capacity(8 + text.len());
+        protocol::framing::write_cut_text(&mut msg, protocol::CLIENT_CUT_TEXT, text.as_bytes());
         stream.write_all(&msg)?;
         Ok(())
     }
@@ -1569,15 +1529,15 @@ impl VncClient {
                 self.last_msg_type = Some(protocol::SERVER_SERVER_CUT_TEXT);
                 self.handle_server_cut_text(&mut events)
             }
-            4 => {
+            protocol::SERVER_END_OF_CONTINUOUS_UPDATES_LEGACY => {
                 log::debug!("Server message: EndOfContinuousUpdates (legacy type 4)");
-                self.last_msg_type = Some(4);
+                self.last_msg_type = Some(protocol::SERVER_END_OF_CONTINUOUS_UPDATES_LEGACY);
                 events.push(VncEvent::EndOfContinuousUpdates);
                 Ok(())
             }
-            5 => {
+            protocol::SERVER_FENCE_LEGACY => {
                 log::debug!("Server message: ServerFence (legacy type 5)");
-                self.last_msg_type = Some(5);
+                self.last_msg_type = Some(protocol::SERVER_FENCE_LEGACY);
                 self.handle_server_fence(&mut events)
             }
             protocol::SERVER_END_OF_CONTINUOUS_UPDATES => {
@@ -1591,9 +1551,9 @@ impl VncClient {
                 self.last_msg_type = Some(protocol::CLIENT_FENCE);
                 self.handle_server_fence(&mut events)
             }
-            255 => {
+            protocol::qemu::MESSAGE_TYPE => {
                 log::debug!("Server message: QEMU extension");
-                self.last_msg_type = Some(255);
+                self.last_msg_type = Some(protocol::qemu::MESSAGE_TYPE);
                 self.handle_qemu_extension(&mut events)
             }
             protocol::apple::MISC_STATUS => {
@@ -1629,11 +1589,9 @@ impl VncClient {
     }
 
     fn handle_framebuffer_update(&mut self, events: &mut Vec<VncEvent>) -> Result<(), VncError> {
-        let mut buf = [0u8; 3];
         let num_rects = {
             let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-            stream.read_exact(&mut buf)?;
-            u16::from_be_bytes([buf[1], buf[2]])
+            protocol::framing::read_fb_update_header(stream)?
         };
         self.recent_encodings.clear();
         self.recent_encodings.reserve(num_rects as usize);
@@ -1643,50 +1601,61 @@ impl VncClient {
             let (x, y, width, height, encoding) = {
                 let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                 stream.read_exact(&mut rect_header)?;
-                let x = u16::from_be_bytes([rect_header[0], rect_header[1]]);
-                let y = u16::from_be_bytes([rect_header[2], rect_header[3]]);
-                let width = u16::from_be_bytes([rect_header[4], rect_header[5]]);
-                let height = u16::from_be_bytes([rect_header[6], rect_header[7]]);
-                let encoding = i32::from_be_bytes([
-                    rect_header[8],
-                    rect_header[9],
-                    rect_header[10],
-                    rect_header[11],
-                ]);
+                let header = protocol::framing::RectHeader::from_bytes(&rect_header);
+                let (x, y, width, height, encoding) = (
+                    header.x,
+                    header.y,
+                    header.width,
+                    header.height,
+                    header.encoding,
+                );
                 self.last_encoding = Some(encoding);
                 self.recent_encodings.push(encoding);
                 (x, y, width, height, encoding)
             };
 
-            match encoding {
-                0 => self.handle_raw_encoding(x, y, width, height)?,
-                1 => self.handle_copyrect_encoding(x, y, width, height)?,
-                2 => self.handle_rre_encoding(x, y, width, height)?,
-                5 => self.handle_hextile_encoding(x, y, width, height)?,
-                6 => self.handle_zlib_encoding(x, y, width, height)?,
-                7 => self.handle_tight_encoding(x, y, width, height)?,
-                15 => self.handle_trle_encoding(x, y, width, height)?,
-                16 => self.handle_zrle_encoding(x, y, width, height)?,
-                50 => self.handle_openh264_encoding(x, y, width, height)?,
-                -223 => self.handle_desktop_size_pseudo_encoding(x, y, width, height, events)?,
-                -240 => {
+            // Rectangles carry peer-controlled u16 dimensions; reject absurd
+            // sizes before any decoder derives an allocation from them. This
+            // also covers the DesktopSize-family pseudo-encodings, whose
+            // width/height are the new framebuffer size.
+            check_dimensions(width as u32, height as u32)?;
+
+            match encodings::from_i32(encoding) {
+                Encoding::Raw => self.handle_raw_encoding(x, y, width, height)?,
+                Encoding::CopyRect => self.handle_copyrect_encoding(x, y, width, height)?,
+                Encoding::Rre => self.handle_rre_encoding(x, y, width, height)?,
+                Encoding::Hextile => self.handle_hextile_encoding(x, y, width, height)?,
+                Encoding::Zlib => self.handle_zlib_encoding(x, y, width, height)?,
+                Encoding::Tight => self.handle_tight_encoding(x, y, width, height)?,
+                Encoding::Trle => self.handle_trle_encoding(x, y, width, height)?,
+                Encoding::Zrle => self.handle_zrle_encoding(x, y, width, height)?,
+                Encoding::OpenH264 => self.handle_openh264_encoding(x, y, width, height)?,
+                Encoding::DesktopSize => {
+                    self.handle_desktop_size_pseudo_encoding(x, y, width, height, events)?
+                }
+                Encoding::CursorPos => {
                     // CursorPos pseudo-encoding: no extra data
                     events.push(VncEvent::CursorPos { x, y });
                 }
-                -239 => self.handle_cursor_pseudo_encoding(x, y, width, height, events)?,
-                -307 => self.handle_desktop_name_pseudo_encoding(events)?,
-                -308 => {
+                Encoding::Cursor => {
+                    self.handle_cursor_pseudo_encoding(x, y, width, height, events)?
+                }
+                Encoding::DesktopName => self.handle_desktop_name_pseudo_encoding(events)?,
+                Encoding::ExtendedDesktopSize => {
                     self.handle_extended_desktop_size_pseudo_encoding(x, y, width, height, events)?
                 }
-                -1063131699 => {
+                Encoding::ExtendedClipboard => {
                     // Extended Clipboard pseudo-encoding is only a capability
                     // declaration; actual clipboard data comes via ServerCutText.
                     // The server should not send pixel data for this encoding.
+                    // Both wire values exist in the wild (LibVNCServer/UltraVNC
+                    // vs QEMU-derived servers); `from_i32` maps either to this
+                    // variant.
                     log::debug!("Ignoring ExtendedClipboard pseudo-encoding rectangle");
                 }
-                -312 => self.handle_fence_pseudo_encoding(events, width, height)?,
+                Encoding::Fence => self.handle_fence_pseudo_encoding(events, width, height)?,
                 // Apple high-performance pseudo-encodings.
-                enc if enc == protocol::apple::ENC_REKEY => {
+                Encoding::AppleHp(enc) if enc == protocol::apple::ENC_REKEY => {
                     let mut body = vec![0u8; 36];
                     {
                         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
@@ -1702,15 +1671,15 @@ impl VncClient {
                     );
                     continue;
                 }
-                enc if enc == protocol::apple::ENC_CURSOR => {
+                Encoding::AppleHp(enc) if enc == protocol::apple::ENC_CURSOR => {
                     self.handle_apple_cursor_encoding(x, y, width, height, events)?;
                     continue;
                 }
-                enc if enc == protocol::apple::ENC_DISPLAY_LAYOUT => {
+                Encoding::AppleHp(enc) if enc == protocol::apple::ENC_DISPLAY_LAYOUT => {
                     self.handle_apple_display_layout(x, y, width, height, events)?;
                     continue;
                 }
-                enc if enc == protocol::apple::ENC_VENDOR_KEYSYMS => {
+                Encoding::AppleHp(enc) if enc == protocol::apple::ENC_VENDOR_KEYSYMS => {
                     // Apple vendor keysyms (fixed 22-byte payload).
                     let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                     let mut payload = vec![0u8; 22];
@@ -1721,15 +1690,15 @@ impl VncClient {
                     );
                     continue;
                 }
-                enc if enc == protocol::apple::ENC_KEYBOARD_INPUT_SOURCE => {
+                Encoding::AppleHp(enc) if enc == protocol::apple::ENC_KEYBOARD_INPUT_SOURCE => {
                     self.handle_apple_keyboard_input_source(events)?;
                     continue;
                 }
-                enc if enc == protocol::apple::ENC_DEVICE_INFO => {
+                Encoding::AppleHp(enc) if enc == protocol::apple::ENC_DEVICE_INFO => {
                     self.handle_apple_device_info(events)?;
                     continue;
                 }
-                enc if enc == protocol::apple::ENC_MEDIA_STREAM => {
+                Encoding::AppleHp(enc) if enc == protocol::apple::ENC_MEDIA_STREAM => {
                     // Apple media stream announcement (u16 payload_len + payload).
                     let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                     let mut len_buf = [0u8; 2];
@@ -1743,16 +1712,27 @@ impl VncClient {
                     );
                     continue;
                 }
-                enc if enc == protocol::apple::ENC_LOW_QUALITY
-                    || enc == protocol::apple::ENC_MEDIUM_QUALITY
-                    || enc == protocol::apple::ENC_HIGH_QUALITY
-                    || enc == protocol::apple::ENC_MULTI_VARIANT_SCALED =>
+                Encoding::AppleHp(enc)
+                    if enc == protocol::apple::ENC_LOW_QUALITY
+                        || enc == protocol::apple::ENC_MEDIUM_QUALITY
+                        || enc == protocol::apple::ENC_HIGH_QUALITY
+                        || enc == protocol::apple::ENC_MULTI_VARIANT_SCALED =>
                 {
                     // Apple still-image codecs (u32 nbytes + payload).
                     let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
                     let mut len_buf = [0u8; 4];
                     stream.read_exact(&mut len_buf)?;
                     let len = u32::from_be_bytes(len_buf) as usize;
+                    // Compressed still images (JPEG/HEIF-style) of a full
+                    // screen are a few MiB even at 8K; 32 MiB is generous and
+                    // stops a malicious length from forcing a huge allocation.
+                    const MAX_STILL_IMAGE_LEN: usize = 32 * 1024 * 1024;
+                    if len > MAX_STILL_IMAGE_LEN {
+                        return Err(VncError::Protocol(format!(
+                            "Apple still-image payload length {} exceeds limit",
+                            len
+                        )));
+                    }
                     let mut payload = vec![0u8; len];
                     stream.read_exact(&mut payload)?;
                     log::debug!("Apple still-image codec (encoding {:#x}) ignored", enc);
@@ -1788,17 +1768,12 @@ impl VncClient {
         height: u16,
     ) -> Result<(), VncError> {
         let pixel_format = self.pixel_format;
-        let bpp = pixel_format.bytes_per_pixel();
-        let row_size = width as usize * bpp;
-        let total_size = row_size * height as usize;
         log::debug!(
-            "Raw encoding: {}x{}@({}, {}) bpp={} total_size={} pixel_format={:?}",
+            "Raw encoding: {}x{}@({}, {}) pixel_format={:?}",
             width,
             height,
             x,
             y,
-            bpp,
-            total_size,
             pixel_format
         );
 
@@ -1809,31 +1784,22 @@ impl VncClient {
         self.set_read_timeout(Some(Duration::from_secs(60)))?;
 
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut data = vec![0u8; total_size];
-        let read_result = stream.read_exact(&mut data);
-
-        // Restore the previous timeout best-effort; report the original read
-        // error if it failed.
-        let _ = self.set_read_timeout(saved_timeout);
-        read_result?;
-
-        self.framebuffer.write_region(
+        let decode_result = protocol::raw::decode(
+            stream,
+            &mut self.framebuffer,
             x as usize,
             y as usize,
             width as usize,
             height as usize,
-            &data,
             &pixel_format,
         );
 
-        log::debug!(
-            "Raw encoding complete: {}x{}@({}, {}) total_size={}",
-            width,
-            height,
-            x,
-            y,
-            total_size
-        );
+        // Restore the previous timeout best-effort; report the original decode
+        // error if it failed.
+        let _ = self.set_read_timeout(saved_timeout);
+        decode_result?;
+
+        log::debug!("Raw encoding complete: {}x{}@({}, {})", width, height, x, y);
         Ok(())
     }
 
@@ -1845,13 +1811,13 @@ impl VncClient {
         height: u16,
     ) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; protocol::framing::CopyRectBody::WIRE_LEN];
         stream.read_exact(&mut buf)?;
-        let src_x = u16::from_be_bytes([buf[0], buf[1]]);
-        let src_y = u16::from_be_bytes([buf[2], buf[3]]);
+        let body = protocol::framing::CopyRectBody::parse(&buf)
+            .ok_or_else(|| VncError::Protocol("Truncated CopyRect body".to_string()))?;
         self.framebuffer.copy_rect(
-            src_x as usize,
-            src_y as usize,
+            body.src_x as usize,
+            body.src_y as usize,
             x as usize,
             y as usize,
             width as usize,
@@ -1898,6 +1864,7 @@ impl VncClient {
             width as usize,
             height as usize,
             &pixel_format,
+            &mut self.hextile_state,
         )?;
         Ok(())
     }
@@ -1978,6 +1945,7 @@ impl VncClient {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         tight::decode(
             stream,
+            &mut self.tight_streams,
             &mut self.framebuffer,
             x as usize,
             y as usize,
@@ -1999,16 +1967,30 @@ impl VncClient {
 
         // OpenH264 encoding data format:
         //   4 bytes big-endian length
-        //   4 bytes big-endian flags
+        //   4 bytes big-endian flags (currently unused)
         //   length bytes H.264 payload
-        let mut header = [0u8; 8];
+        let mut header = [0u8; protocol::framing::OpenH264Header::WIRE_LEN];
         stream.read_exact(&mut header)?;
-        let data_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let _flags = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        let header = protocol::framing::OpenH264Header::parse(&header)
+            .ok_or_else(|| VncError::Protocol("Truncated OpenH264 header".to_string()))?;
+        let data_len = header.len as usize;
+        let _flags = header.flags;
 
         if data_len == 0 {
             // Zero-length frames are used for reset signalling; nothing to decode.
             return Ok(());
+        }
+
+        // An H.264 access unit for one frame is always smaller than the
+        // uncompressed frame (w*h*3 for 4:2:0 at 8 bits is w*h*3/2; use
+        // w*h*3 as a loose bound) plus slack for Annex-B start codes and
+        // SPS/PPS. Reject larger lengths before allocating.
+        let max_data_len = width as usize * height as usize * 3 + 64 * 1024;
+        if data_len > max_data_len {
+            return Err(VncError::Protocol(format!(
+                "OpenH264 payload length {} exceeds bound {} for {}x{} frame",
+                data_len, max_data_len, width, height
+            )));
         }
 
         let mut data = vec![0u8; data_len];
@@ -2078,11 +2060,7 @@ impl VncClient {
         events: &mut Vec<VncEvent>,
     ) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let bpp = self.pixel_format.bytes_per_pixel();
-        let pixel_data_size = width as usize * height as usize * bpp;
-        let mask_row_bytes = (width as usize).div_ceil(8);
-        let mask_size = mask_row_bytes * height as usize;
-        let mut data = vec![0u8; pixel_data_size + mask_size];
+        let mut data = vec![0u8; CursorShape::wire_len(width, height, &self.pixel_format)];
         stream.read_exact(&mut data)?;
         let cursor = CursorShape::decode(width, height, x, y, &data, &self.pixel_format)?;
         events.push(VncEvent::CursorShape(cursor));
@@ -2093,21 +2071,10 @@ impl VncClient {
         &mut self,
         events: &mut Vec<VncEvent>,
     ) -> Result<(), VncError> {
-        const MAX_DESKTOP_NAME_LEN: usize = 4096;
-
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf)?;
-        let name_len = u32::from_be_bytes(buf) as usize;
-        if name_len > MAX_DESKTOP_NAME_LEN {
-            return Err(VncError::Protocol(format!(
-                "DesktopName length {} exceeds limit",
-                name_len
-            )));
-        }
-        let mut name_buf = vec![0u8; name_len];
-        stream.read_exact(&mut name_buf)?;
-        self.name = String::from_utf8_lossy(&name_buf).to_string();
+        // A name length over the cap maps to VncError::Protocol (not Io) via
+        // the ProtocolError conversion.
+        self.name = protocol::framing::read_desktop_name_body(stream)?;
         events.push(VncEvent::NameChanged(self.name.clone()));
         Ok(())
     }
@@ -2120,52 +2087,8 @@ impl VncClient {
         height: u16,
         events: &mut Vec<VncEvent>,
     ) -> Result<(), VncError> {
-        const MAX_SCREENS: usize = 256;
-
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf)?;
-        let num_screens = u32::from_be_bytes(buf) as usize;
-        if num_screens > MAX_SCREENS {
-            return Err(VncError::Protocol(format!(
-                "ExtendedDesktopSize screen count {} exceeds limit",
-                num_screens
-            )));
-        }
-
-        // Read screen data (each screen: u32 id, u16 x, u16 y, u16 width, u16 height, u32 flags)
-        let screen_data_size = num_screens * 16;
-        let mut screen_data = vec![0u8; screen_data_size];
-        stream.read_exact(&mut screen_data)?;
-
-        let mut screens = Vec::with_capacity(num_screens);
-        for i in 0..num_screens {
-            let off = i * 16;
-            let id = u32::from_be_bytes([
-                screen_data[off],
-                screen_data[off + 1],
-                screen_data[off + 2],
-                screen_data[off + 3],
-            ]);
-            let x = u16::from_be_bytes([screen_data[off + 4], screen_data[off + 5]]);
-            let y = u16::from_be_bytes([screen_data[off + 6], screen_data[off + 7]]);
-            let w = u16::from_be_bytes([screen_data[off + 8], screen_data[off + 9]]);
-            let h = u16::from_be_bytes([screen_data[off + 10], screen_data[off + 11]]);
-            let flags = u32::from_be_bytes([
-                screen_data[off + 12],
-                screen_data[off + 13],
-                screen_data[off + 14],
-                screen_data[off + 15],
-            ]);
-            screens.push(Screen {
-                id,
-                x,
-                y,
-                width: w,
-                height: h,
-                flags,
-            });
-        }
+        let screens = protocol::framing::read_screen_list(stream)?;
 
         self.width = width;
         self.height = height;
@@ -2183,20 +2106,16 @@ impl VncClient {
         _height: u16,
     ) -> Result<(), VncError> {
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf)?;
-        let flags = u32::from_be_bytes(buf);
-        let mut len_buf = [0u8; 1];
-        stream.read_exact(&mut len_buf)?;
-        let len = len_buf[0] as usize;
-        let mut data = vec![0u8; len];
-        stream.read_exact(&mut data)?;
+        let fence = protocol::framing::Fence::read_rect_body(stream)?;
         log::debug!(
             "Fence pseudo-encoding rect flags={:#010x} len={}",
-            flags,
-            len
+            fence.flags,
+            fence.payload.len()
         );
-        events.push(VncEvent::Fence { flags, data });
+        events.push(VncEvent::Fence {
+            flags: fence.flags,
+            data: fence.payload,
+        });
         Ok(())
     }
 
@@ -2224,6 +2143,17 @@ impl VncClient {
 
         if compressed_len > 0 {
             // STORE: read and cache a new cursor shape.
+            // The payload is zlib-compressed BGRA pixels plus a separate
+            // alpha plane: 5 bytes per pixel uncompressed. A zlib stream
+            // never needs more bytes than its output plus format overhead,
+            // so reject larger lengths before allocating.
+            let max_len = width as usize * height as usize * 5 + 64 * 1024;
+            if compressed_len > max_len {
+                return Err(VncError::Protocol(format!(
+                    "Apple cursor STORE length {} exceeds bound {} for {}x{} cursor",
+                    compressed_len, max_len, width, height
+                )));
+            }
             let mut payload = vec![0u8; compressed_len];
             stream.read_exact(&mut payload)?;
             let cursor = self.decode_apple_cursor_store(width, height, &payload)?;
@@ -2256,12 +2186,19 @@ impl VncClient {
         events: &mut Vec<VncEvent>,
     ) -> Result<(), VncError> {
         if let Some(cursor) = self.apple_cursor_cache.get(&cache_id) {
+            // Apple HP cursor images are RGBA with an alpha channel. The shared
+            // CursorShape stores a separate 1-bit mask and RGBA pixels with alpha
+            // already applied; treat the cursor as fully opaque in the mask and
+            // keep the original alpha in pixels.
+            let mask_row_bytes = (cursor.width as usize).div_ceil(8);
+            let mask = vec![0xff; mask_row_bytes * cursor.height as usize];
             let shape = CursorShape {
                 width: cursor.width,
                 height: cursor.height,
                 hotspot_x: x,
                 hotspot_y: y,
                 pixels: cursor.pixels.clone(),
+                mask,
             };
             log::debug!(
                 "Apple cursor SELECT cache_id={} size={}x{}",
@@ -2290,12 +2227,24 @@ impl VncClient {
         let expected_bgra = pixel_count * 4;
         let expected_alpha = pixel_count;
 
-        let mut decoder = ZlibDecoder::new(payload);
+        let decoder = ZlibDecoder::new(payload);
+        // The expected output is known exactly (BGRA + alpha plane); cap the
+        // inflate at one byte more so a decompression bomb is rejected
+        // instead of growing the buffer without bound.
         let mut decompressed = Vec::with_capacity(expected_bgra + expected_alpha);
         decoder
+            .take((expected_bgra + expected_alpha + 1) as u64)
             .read_to_end(&mut decompressed)
             .map_err(|e| VncError::Protocol(format!("Apple cursor zlib decode error: {}", e)))?;
 
+        if decompressed.len() > expected_bgra + expected_alpha {
+            return Err(VncError::Protocol(format!(
+                "Apple cursor payload too large: got more than {} bytes for {}x{} cursor",
+                expected_bgra + expected_alpha,
+                width,
+                height
+            )));
+        }
         if decompressed.len() < expected_bgra + expected_alpha {
             return Err(VncError::Protocol(format!(
                 "Apple cursor payload too short: got {} bytes, expected {}",
@@ -2368,6 +2317,7 @@ impl VncClient {
         // Use the backing geometry for the local framebuffer, which is where
         // decoded rectangles are written. The scaled size is for window sizing.
         if backing_width > 0 && backing_height > 0 {
+            check_dimensions(backing_width as u32, backing_height as u32)?;
             self.width = backing_width;
             self.height = backing_height;
             self.framebuffer
@@ -2503,9 +2453,7 @@ impl VncClient {
         const MAX_CUT_TEXT_LEN: usize = 10 * 1024 * 1024;
 
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut buf = [0u8; 7];
-        stream.read_exact(&mut buf)?;
-        let len = i32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
+        let len = protocol::framing::read_cut_text_length(stream)?;
         log::debug!("ServerCutText length: {}", len);
 
         if len >= 0 {
@@ -2600,18 +2548,28 @@ impl VncClient {
     /// The server sends this after the client requests the Fence pseudo-encoding.
     /// Format: 3 bytes padding, 4 bytes flags, 1 byte length, length bytes payload.
     fn handle_server_fence(&mut self, events: &mut Vec<VncEvent>) -> Result<(), VncError> {
-        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-        let mut buf = [0u8; 3];
-        stream.read_exact(&mut buf)?; // padding
-        let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf)?;
-        let flags = u32::from_be_bytes(buf);
-        let mut len_buf = [0u8; 1];
-        stream.read_exact(&mut len_buf)?;
-        let len = len_buf[0] as usize;
-        let mut data = vec![0u8; len];
-        stream.read_exact(&mut data)?;
-        log::debug!("ServerFence flags={:#010x} len={}", flags, len);
+        let fence = {
+            let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+            protocol::framing::Fence::read_body(stream)?
+        };
+        let flags = fence.flags;
+        let data = fence.payload;
+        log::debug!("ServerFence flags={:#010x} len={}", flags, data.len());
+
+        // Echo the fence back to the server when it requested a response.
+        // This is the standard client-side behaviour for the Fence
+        // pseudo-encoding and allows servers (e.g. wayvnc/neatvnc) to measure
+        // their own round-trip times and bandwidth. Per the spec the response
+        // clears the Request bit plus any bits we do not understand, keeps the
+        // known synchronisation bits, and echoes the payload.
+        if flags & protocol::FENCE_FLAG_REQUEST != 0 {
+            let echo_flags = flags
+                & (protocol::FENCE_FLAG_BLOCK_BEFORE
+                    | protocol::FENCE_FLAG_BLOCK_AFTER
+                    | protocol::FENCE_FLAG_SYNC_NEXT);
+            let _ = self.send_fence(echo_flags, &data);
+        }
+
         events.push(VncEvent::Fence { flags, data });
         Ok(())
     }
@@ -2628,52 +2586,61 @@ impl VncClient {
         let sub_type = buf[0];
 
         match sub_type {
-            1 => {
+            protocol::qemu::SUB_TYPE_LED_STATE => {
                 // LED State
                 stream.read_exact(&mut buf)?;
-                let state = buf[0];
+                let led = protocol::qemu::parse_led_state(buf[0]);
                 events.push(VncEvent::LedState {
-                    scroll_lock: (state & 0x01) != 0,
-                    num_lock: (state & 0x02) != 0,
-                    caps_lock: (state & 0x04) != 0,
+                    scroll_lock: led.scroll_lock,
+                    num_lock: led.num_lock,
+                    caps_lock: led.caps_lock,
                 });
             }
-            2 => {
+            protocol::qemu::SUB_TYPE_AUDIO => {
                 // Audio (QEMU extension)
                 stream.read_exact(&mut buf)?;
                 let operation = buf[0];
                 match operation {
-                    0 => {
+                    protocol::qemu::AUDIO_OP_STOP => {
                         // Stop audio
                         // No additional data; UI should stop playback
                     }
-                    1 => {
+                    protocol::qemu::AUDIO_OP_START => {
                         // Start audio / format info
-                        let mut fmt_buf = [0u8; 10];
+                        let mut fmt_buf = [0u8; protocol::qemu::AudioFormatHeader::WIRE_LEN];
                         stream.read_exact(&mut fmt_buf)?;
-                        let sample_rate =
-                            u32::from_be_bytes([fmt_buf[0], fmt_buf[1], fmt_buf[2], fmt_buf[3]]);
-                        let channels = fmt_buf[4];
-                        let bits_per_sample = fmt_buf[5];
-                        let data_len =
-                            u32::from_be_bytes([fmt_buf[6], fmt_buf[7], fmt_buf[8], fmt_buf[9]])
-                                as usize;
+                        let fmt = protocol::qemu::AudioFormatHeader::parse(&fmt_buf).ok_or_else(
+                            || VncError::Protocol("Truncated QEMU audio header".to_string()),
+                        )?;
+                        let data_len = fmt.data_len as usize;
+                        if data_len > MAX_QEMU_AUDIO_LEN {
+                            return Err(VncError::Protocol(format!(
+                                "QEMU audio length {} exceeds limit",
+                                data_len
+                            )));
+                        }
                         let mut data = vec![0u8; data_len];
                         if data_len > 0 {
                             stream.read_exact(&mut data)?;
                         }
                         events.push(VncEvent::Audio {
-                            sample_rate,
-                            channels,
-                            bits_per_sample,
+                            sample_rate: fmt.sample_rate,
+                            channels: fmt.channels,
+                            bits_per_sample: fmt.bits_per_sample,
                             data,
                         });
                     }
-                    2 => {
+                    protocol::qemu::AUDIO_OP_DATA => {
                         // Audio data
                         let mut len_buf = [0u8; 4];
                         stream.read_exact(&mut len_buf)?;
                         let data_len = u32::from_be_bytes(len_buf) as usize;
+                        if data_len > MAX_QEMU_AUDIO_LEN {
+                            return Err(VncError::Protocol(format!(
+                                "QEMU audio length {} exceeds limit",
+                                data_len
+                            )));
+                        }
                         let mut data = vec![0u8; data_len];
                         if data_len > 0 {
                             stream.read_exact(&mut data)?;
@@ -2833,7 +2800,9 @@ pub struct AppleDeviceInfo {
 ///
 /// Returns `None` if the payload is too short or malformed.
 fn parse_apple_device_info(payload: &[u8]) -> Option<AppleDeviceInfo> {
-    if payload.len() < 12 {
+    // Fixed header: block_pair_count(2) + structure_version(4) +
+    // enclosure_rgb_color(4) + three u16 string lengths = 16 bytes.
+    if payload.len() < 16 {
         return None;
     }
     let _block_pair_count = u16::from_be_bytes([payload[0], payload[1]]);
@@ -3133,6 +3102,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_apple_device_info_short_payload_is_rejected() {
+        // Regression: the fixed header is 16 bytes (2 + 4 + 4 + 3 * u16
+        // string lengths). A 12-byte payload previously passed the length
+        // check and then panicked reading payload[12..16].
+        let payload = [0u8; 12];
+        assert_eq!(parse_apple_device_info(&payload), None);
+
+        // 15 bytes is still too short.
+        let payload = [0u8; 15];
+        assert_eq!(parse_apple_device_info(&payload), None);
+
+        // A minimal well-formed payload: no strings, just the fixed header
+        // plus the trailing housing_color i32.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u16.to_be_bytes()); // block_pair_count
+        payload.extend_from_slice(&1u32.to_be_bytes()); // structure_version
+        payload.extend_from_slice(&0xaabbccddu32.to_be_bytes()); // enclosure_rgb_color
+        payload.extend_from_slice(&0u16.to_be_bytes()); // identifier_len
+        payload.extend_from_slice(&0u16.to_be_bytes()); // color_len
+        payload.extend_from_slice(&0u16.to_be_bytes()); // enclosure_len
+        payload.extend_from_slice(&7i32.to_be_bytes()); // housing_color
+        let info = parse_apple_device_info(&payload).expect("16-byte header parses");
+        assert_eq!(info.structure_version, 1);
+        assert_eq!(info.enclosure_rgb_color, 0xaabbccdd);
+        assert_eq!(info.housing_color, 7);
+        assert_eq!(info.device_identifier, "");
+    }
+
+    #[test]
     fn apple_cursor_decode_store() {
         use flate2::write::ZlibEncoder;
         use flate2::Compression;
@@ -3186,6 +3184,7 @@ mod tests {
         assert_eq!(shape.hotspot_x, 5);
         assert_eq!(shape.hotspot_y, 6);
         assert_eq!(shape.pixels, vec![0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(shape.mask, vec![0xff]); // 1 visible pixel, remaining padding bits also 1
     }
 
     #[test]
@@ -3373,6 +3372,189 @@ mod tests {
         ));
         assert!(matches!(
             client.send_hp_auto_pasteboard(3),
+            Err(VncError::Protocol(_))
+        ));
+    }
+
+    /// Build a client connected to a loopback socket, returning the client and
+    /// the server end of the connection for reading/writing wire bytes.
+    fn fence_test_client() -> (VncClient, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let server_side = listener.accept().unwrap().0;
+        let mut client = VncClientBuilder::new().build();
+        client.stream = Some(VncStream {
+            inner: VncStreamInner::Plain(stream),
+            bytes_read: 0,
+            bytes_written: 0,
+        });
+        (client, server_side)
+    }
+
+    #[test]
+    fn send_fence_writes_spec_wire_format() {
+        let (mut client, mut server) = fence_test_client();
+        let flags = protocol::FENCE_FLAG_REQUEST | protocol::FENCE_FLAG_BLOCK_BEFORE;
+        client.send_fence(flags, b"ping").unwrap();
+
+        // ClientFence: type u8 (248), 3 bytes padding, flags u32, length u8,
+        // payload[length].
+        let mut buf = [0u8; 13];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            [
+                248, 0, 0, 0, // message type + padding
+                0x80, 0x00, 0x00, 0x01, // flags: Request | BlockBefore
+                4,    // payload length (u8)
+                b'p', b'i', b'n', b'g',
+            ]
+        );
+    }
+
+    #[test]
+    fn send_fence_rejects_payload_over_255_bytes() {
+        let (mut client, _server) = fence_test_client();
+        let data = vec![0u8; 256];
+        assert!(matches!(
+            client.send_fence(protocol::FENCE_FLAG_REQUEST, &data),
+            Err(VncError::Protocol(_))
+        ));
+        // 255 bytes is the maximum the u8 length field can express.
+        let data = vec![0u8; 255];
+        client
+            .send_fence(protocol::FENCE_FLAG_REQUEST, &data)
+            .unwrap();
+    }
+
+    #[test]
+    fn server_fence_request_is_echoed_with_request_cleared() {
+        let (mut client, mut server) = fence_test_client();
+        // ServerFence: 3 bytes padding, flags u32, length u8, payload.
+        server
+            .write_all(&[
+                0, 0, 0, // padding
+                0x80, 0x00, 0x00, 0x03, // flags: Request | BlockBefore | BlockAfter
+                3,    // payload length
+                1, 2, 3, // payload
+            ])
+            .unwrap();
+
+        let mut events = Vec::new();
+        client.handle_server_fence(&mut events).unwrap();
+
+        // The echo clears the Request bit and keeps the payload.
+        let mut buf = [0u8; 12];
+        server.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            [
+                248, 0, 0, 0, // ClientFence + padding
+                0x00, 0x00, 0x00, 0x03, // BlockBefore | BlockAfter, Request cleared
+                3,    // payload length
+                1, 2, 3,
+            ]
+        );
+
+        assert_eq!(events.len(), 1);
+        match events.remove(0) {
+            VncEvent::Fence { flags, data } => {
+                assert_eq!(flags, 0x8000_0003);
+                assert_eq!(data, vec![1, 2, 3]);
+            }
+            _ => panic!("expected Fence event"),
+        }
+    }
+
+    #[test]
+    fn server_fence_without_request_is_not_echoed() {
+        let (mut client, mut server) = fence_test_client();
+        server
+            .write_all(&[
+                0, 0, 0, // padding
+                0x00, 0x00, 0x00, 0x01, // flags: BlockBefore only, no Request
+                2,    // payload length
+                9, 9,
+            ])
+            .unwrap();
+
+        let mut events = Vec::new();
+        client.handle_server_fence(&mut events).unwrap();
+        assert_eq!(events.len(), 1);
+
+        // No response should have been written back to the server.
+        server.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(matches!(
+            server.read(&mut buf),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn handshake_failure_reason_over_limit_rejected() {
+        let (mut client, mut server) = fence_test_client();
+        // num_types == 0 followed by a huge reason length: the client must
+        // reject before allocating or reading the reason bytes.
+        server.write_all(&[0]).unwrap();
+        server.write_all(&70_000u32.to_be_bytes()).unwrap();
+
+        let mut auth = auth::NoAuthHandler;
+        assert!(matches!(
+            client.handshake_auth(&mut auth),
+            Err(VncError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn handshake_failure_reason_within_limit_returned() {
+        let (mut client, mut server) = fence_test_client();
+        server.write_all(&[0]).unwrap();
+        server.write_all(&5u32.to_be_bytes()).unwrap();
+        server.write_all(b"nope!").unwrap();
+
+        let mut auth = auth::NoAuthHandler;
+        match client.handshake_auth(&mut auth) {
+            Err(VncError::AuthFailed(reason)) => assert_eq!(reason, "nope!"),
+            other => panic!("expected AuthFailed, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn framebuffer_update_rejects_absurd_rect_dimensions() {
+        let (mut client, mut server) = fence_test_client();
+        // One Raw rectangle of 65535x1: exceeds the per-dimension cap and
+        // must be rejected before any pixel data is read.
+        server.write_all(&[0, 0, 1]).unwrap(); // padding + num_rects = 1
+        server
+            .write_all(&[
+                0, 0, // x
+                0, 0, // y
+                0xff, 0xff, // width = 65535
+                0, 1, // height = 1
+                0, 0, 0, 0, // encoding = Raw
+            ])
+            .unwrap();
+
+        let mut events = Vec::new();
+        assert!(matches!(
+            client.handle_framebuffer_update(&mut events),
+            Err(VncError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn qemu_audio_length_over_limit_rejected() {
+        let (mut client, mut server) = fence_test_client();
+        // QEMU extension, sub-type 2 (audio), operation 2 (audio data) with
+        // a huge length.
+        server.write_all(&[2, 2]).unwrap();
+        server.write_all(&u32::MAX.to_be_bytes()).unwrap();
+
+        let mut events = Vec::new();
+        assert!(matches!(
+            client.handle_qemu_extension(&mut events),
             Err(VncError::Protocol(_))
         ));
     }

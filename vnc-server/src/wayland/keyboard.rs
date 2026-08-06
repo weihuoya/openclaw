@@ -3,11 +3,21 @@
 //! This module provides keyboard input injection using the Linux uinput
 //! subsystem, which works independently of the Wayland compositor.
 
-use log::{debug, error};
+use log::{debug, error, warn};
+
+/// Linux keycode for the left Shift key (KEY_LEFTSHIFT).
+const KEY_LEFTSHIFT: u16 = 42;
+/// Linux keycode for the right Shift key (KEY_RIGHTSHIFT).
+const KEY_RIGHTSHIFT: u16 = 54;
 
 /// A virtual keyboard device using uinput.
 pub struct VirtualKeyboard {
     device: Option<evdev::uinput::VirtualDevice>,
+    /// Whether Shift is currently held on the host. Set by client Shift
+    /// keysym events (and raw Shift keycodes from the QEMU extended key
+    /// event); used to avoid synthesizing redundant Shift presses around
+    /// shifted characters while the client already holds Shift.
+    shift_held: bool,
 }
 
 impl VirtualKeyboard {
@@ -31,17 +41,27 @@ impl VirtualKeyboard {
         debug!("Virtual keyboard created");
         Ok(Self {
             device: Some(device),
+            shift_held: false,
         })
     }
 
     /// Send a key event.
     pub fn key(&mut self, keycode: u32, pressed: bool) {
+        let Ok(keycode) = u16::try_from(keycode) else {
+            warn!("Ignoring out-of-range keycode: {}", keycode);
+            return;
+        };
+
+        if keycode == KEY_LEFTSHIFT || keycode == KEY_RIGHTSHIFT {
+            self.shift_held = pressed;
+        }
+
         let Some(ref mut device) = self.device else {
             return;
         };
 
         let value = if pressed { 1 } else { 0 };
-        let event = evdev::InputEvent::new(evdev::EventType::KEY.0, keycode as u16, value);
+        let event = evdev::InputEvent::new(evdev::EventType::KEY.0, keycode, value);
 
         if let Err(e) = device.emit(&[event]) {
             error!("Failed to emit key event: {}", e);
@@ -50,13 +70,75 @@ impl VirtualKeyboard {
 
     /// Send a keysym (X11 keysym) event.
     ///
-    /// This converts an X11 keysym to a Linux keycode.
+    /// This converts an X11 keysym to a Linux keycode, synthesizing Shift
+    /// presses around keysyms that require Shift on a US layout.
     pub fn keysym(&mut self, keysym: u32, pressed: bool) {
-        let keycode = keysym_to_keycode(keysym);
-        if keycode > 0 {
-            self.key(keycode, pressed);
+        for (keycode, pressed) in keysym_events(&mut self.shift_held, keysym, pressed) {
+            let Some(ref mut device) = self.device else {
+                return;
+            };
+            let value = if pressed { 1 } else { 0 };
+            let event = evdev::InputEvent::new(evdev::EventType::KEY.0, keycode, value);
+            if let Err(e) = device.emit(&[event]) {
+                error!("Failed to emit key event: {}", e);
+            }
         }
     }
+}
+
+/// Compute the sequence of (keycode, pressed) events to inject for a keysym
+/// event, updating `shift_held` (whether Shift is currently held on the host).
+///
+/// Keysyms that require Shift on a US layout (uppercase letters and the
+/// shifted symbols !@#$%^&*()_+{}|:"<>?~) are wrapped in Shift presses: for a
+/// key-down, Shift goes down before the key; for a key-up, Shift goes up
+/// after the key. When the client already holds Shift (tracked in
+/// `shift_held` from Shift keysym/keycode events), no synthetic Shift events
+/// are emitted, so the common case of the user holding a physical Shift key
+/// works and does not conflict with the synthesized presses.
+///
+/// Limitations: the mapping assumes a US layout; synthetic Shift presses are
+/// emitted per keysym event, so typing a run of shifted characters without
+/// holding Shift produces redundant (but harmless) Shift down/up pairs; and
+/// interleaving physical Shift with held synthetic-Shift keys can produce
+/// extra Shift events, which the host treats as repeats.
+fn keysym_events(shift_held: &mut bool, keysym: u32, pressed: bool) -> Vec<(u16, bool)> {
+    let keycode = keysym_to_keycode(keysym);
+    if keycode == 0 {
+        // Unmapped keysym; keysym_to_keycode already logged it.
+        return Vec::new();
+    }
+    let keycode = keycode as u16;
+
+    if keycode == KEY_LEFTSHIFT || keycode == KEY_RIGHTSHIFT {
+        *shift_held = pressed;
+        return vec![(keycode, pressed)];
+    }
+
+    if !keysym_needs_shift(keysym) || *shift_held {
+        return vec![(keycode, pressed)];
+    }
+
+    if pressed {
+        vec![(KEY_LEFTSHIFT, true), (keycode, true)]
+    } else {
+        vec![(keycode, false), (KEY_LEFTSHIFT, false)]
+    }
+}
+
+/// Whether a keysym requires Shift on a US keyboard layout.
+fn keysym_needs_shift(keysym: u32) -> bool {
+    matches!(keysym,
+        // A-Z
+        0x0041..=0x005a
+        // ! " # $ % & ( ) * +
+        | 0x0021..=0x0026 | 0x0028..=0x002b
+        // : < > ?
+        | 0x003a | 0x003c..=0x003f
+        // @ ^ _
+        | 0x0040 | 0x005e | 0x005f
+        // { | } ~
+        | 0x007b..=0x007e)
 }
 
 /// Convert X11 keysym to Linux keycode.
@@ -202,5 +284,100 @@ fn keysym_to_keycode(keysym: u32) -> u32 {
 impl Drop for VirtualKeyboard {
     fn drop(&mut self) {
         debug!("Virtual keyboard destroyed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY_A: u16 = 30;
+
+    #[test]
+    fn unshifted_keysym_emits_plain_key() {
+        let mut shift_held = false;
+        assert_eq!(
+            keysym_events(&mut shift_held, 0x61, true), // 'a'
+            vec![(KEY_A, true)]
+        );
+        assert!(!shift_held);
+    }
+
+    #[test]
+    fn uppercase_keysym_wraps_in_shift() {
+        let mut shift_held = false;
+        assert_eq!(
+            keysym_events(&mut shift_held, 0x41, true), // 'A' down
+            vec![(KEY_LEFTSHIFT, true), (KEY_A, true)]
+        );
+        assert_eq!(
+            keysym_events(&mut shift_held, 0x41, false), // 'A' up
+            vec![(KEY_A, false), (KEY_LEFTSHIFT, false)]
+        );
+        // Synthetic Shift is not tracked as held.
+        assert!(!shift_held);
+    }
+
+    #[test]
+    fn shifted_symbol_wraps_in_shift() {
+        let mut shift_held = false;
+        // '!' is Shift+1 (KEY_1 = 2) on a US layout.
+        assert_eq!(
+            keysym_events(&mut shift_held, 0x21, true),
+            vec![(KEY_LEFTSHIFT, true), (2, true)]
+        );
+        assert_eq!(
+            keysym_events(&mut shift_held, 0x21, false),
+            vec![(2, false), (KEY_LEFTSHIFT, false)]
+        );
+    }
+
+    #[test]
+    fn client_held_shift_suppresses_synthetic_shift() {
+        let mut shift_held = false;
+        // Client presses Shift_L.
+        assert_eq!(
+            keysym_events(&mut shift_held, 0xFFE1, true),
+            vec![(KEY_LEFTSHIFT, true)]
+        );
+        assert!(shift_held);
+        // 'A' while Shift is held: no synthetic Shift events.
+        assert_eq!(
+            keysym_events(&mut shift_held, 0x41, true),
+            vec![(KEY_A, true)]
+        );
+        assert_eq!(
+            keysym_events(&mut shift_held, 0x41, false),
+            vec![(KEY_A, false)]
+        );
+        // Client releases Shift_L.
+        assert_eq!(
+            keysym_events(&mut shift_held, 0xFFE1, false),
+            vec![(KEY_LEFTSHIFT, false)]
+        );
+        assert!(!shift_held);
+    }
+
+    #[test]
+    fn unmapped_keysym_emits_nothing() {
+        let mut shift_held = false;
+        assert!(keysym_events(&mut shift_held, 0xdead, true).is_empty());
+    }
+
+    #[test]
+    fn out_of_range_qemu_keycode_is_rejected() {
+        let mut kb = VirtualKeyboard {
+            device: None,
+            shift_held: false,
+        };
+        // A huge keycode must be rejected before any Shift tracking happens
+        // (0x10000 + 42 would truncate to KEY_LEFTSHIFT without the check).
+        kb.key(0x10000 + KEY_LEFTSHIFT as u32, true);
+        assert!(!kb.shift_held);
+        // In-range Shift keycode is tracked.
+        kb.key(KEY_LEFTSHIFT as u32, true);
+        assert!(kb.shift_held);
+        kb.key(KEY_LEFTSHIFT as u32, false);
+        assert!(!kb.shift_held);
     }
 }

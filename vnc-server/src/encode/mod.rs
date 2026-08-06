@@ -1,4 +1,9 @@
+pub mod copyrect;
+pub mod cursor;
 pub mod hextile;
 pub mod raw;
+pub mod rre;
 pub mod tight;
+pub mod trle;
+pub mod zlib;
 pub mod zrle;

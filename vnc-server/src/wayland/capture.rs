@@ -31,7 +31,6 @@ pub struct FrameData {
 
 /// State for a single capture buffer with mmap-backed SHM.
 struct CaptureBuffer {
-    #[allow(dead_code)]
     buffer: WlBuffer,
     #[allow(dead_code)]
     pool: WlShmPool,
@@ -141,8 +140,11 @@ pub struct CaptureManager {
 
 struct CurrentCapture {
     buffer_idx: usize,
-    #[allow(dead_code)]
     frame: ZwlrScreencopyFrameV1,
+    /// Whether `frame.copy()` has been issued. The copy request is only sent
+    /// after the compositor's `buffer_done` event; strict wlr-screencopy
+    /// compositors treat copy-before-buffer-done as a protocol error.
+    copied: bool,
     ready: bool,
     failed: bool,
 }
@@ -202,16 +204,30 @@ impl CaptureManager {
             self.manager
                 .capture_output(if overlay_cursor { 1 } else { 0 }, &self.output, qh, ());
 
-        frame.copy(&buf.buffer);
-
+        // The copy request is deferred until the compositor sends
+        // `buffer_done` (see `on_buffer_done`).
         self.current_capture = Some(CurrentCapture {
             buffer_idx: idx,
             frame,
+            copied: false,
             ready: false,
             failed: false,
         });
 
         true
+    }
+
+    /// Called when the compositor sends `buffer_done` for the current frame:
+    /// the buffer parameters are known, so the copy can now be issued.
+    pub fn on_buffer_done(&mut self) {
+        let Some(cap) = self.current_capture.as_mut() else {
+            return;
+        };
+        if cap.copied {
+            return;
+        }
+        cap.frame.copy(&self.buffers[cap.buffer_idx].buffer);
+        cap.copied = true;
     }
 
     /// Called when a frame capture succeeds.
@@ -325,6 +341,11 @@ pub fn run_capture_loop<F>(
 
         if queue.prepare_read().is_some() {
             conn.flush().ok();
+        }
+
+        if state.capture_buffer_done {
+            capture_mgr.on_buffer_done();
+            state.capture_buffer_done = false;
         }
 
         if pending && capture_mgr.is_complete() {

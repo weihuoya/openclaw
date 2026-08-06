@@ -194,10 +194,11 @@ impl VideoDecoder for MediaCodecDecoder {
 }
 
 // Safety: `MediaCodec` is thread-safe (AMediaCodec is refcounted), and we only
-// call it from a single thread in the VNC client. Cell/RefCell handle interior
-// mutability safely within one thread.
+// call it from a single thread in the VNC client. The decoder uses
+// Cell/RefCell interior mutability and is deliberately NOT `Sync`: shared
+// references across threads could double-borrow the RefCell. The
+// `VideoDecoder` trait only requires `Send`.
 unsafe impl Send for MediaCodecDecoder {}
-unsafe impl Sync for MediaCodecDecoder {}
 
 // ─── Helper trait for writing into `MaybeUninit` slice ───
 

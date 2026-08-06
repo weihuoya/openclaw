@@ -355,22 +355,11 @@ impl<S: Read + Write> Write for AppleRecordLayer<S> {
 /// Apple high-performance encoding list.
 ///
 /// This is the full list advertised by the native client during the HP handshake.
-/// It is sent once in plaintext before the rekey and once encrypted after.
+/// It is sent once in plaintext before the rekey and once encrypted after
+/// (via [`vnc_protocol::framing::build_set_encodings`]).
 pub const APPLE_HP_ENCODINGS: &[i32] = &[
     1010, 1011, 1002, 6, 16, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110,
 ];
-
-/// Build a `SetEncodings` (0x02) message carrying raw RFB encoding values.
-pub fn build_set_encodings(encodings: &[i32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(4 + encodings.len() * 4);
-    msg.push(protocol::CLIENT_SET_ENCODINGS);
-    msg.push(0);
-    msg.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
-    for &enc in encodings {
-        msg.extend_from_slice(&enc.to_be_bytes());
-    }
-    msg
-}
 
 /// Build a `ViewerInfo` (0x21) message.
 ///
@@ -678,7 +667,7 @@ mod tests {
         let written = layer.inner.into_inner();
         // Verify ciphertext length is a non-zero multiple of 16 and is prefixed by u16.
         let ct_len = u16::from_be_bytes([written[0], written[1]]) as usize;
-        assert!(ct_len > 0 && ct_len % 16 == 0);
+        assert!(ct_len > 0 && ct_len.is_multiple_of(16));
         // Read it back from a fresh cursor.
         let read_cursor = Cursor::new(written);
         let mut layer2 = AppleRecordLayer::new(read_cursor, [0u8; 16], [1u8; 16], [2u8; 16]);

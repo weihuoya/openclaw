@@ -1,22 +1,18 @@
+//! TRLE (Tiled Run-Length Encoding) decoder, encoding type 15.
+//!
+//! TRLE uses exactly the same 64x64 tile format as ZRLE (subencodings 0 raw,
+//! 1 solid, 2..=16 packed palette, 128 plain RLE, 129..=255 palette RLE); the
+//! only difference is the transport: TRLE tiles are read directly from the
+//! stream, while ZRLE wraps the tile stream in a zlib stream with a 4-byte
+//! length prefix per rectangle. The tile decoding logic is shared with the
+//! ZRLE decoder in [`vnc_protocol::zrle::decode_tiles`].
+
 use std::io::Read;
 
 use crate::framebuffer::{Framebuffer, PixelFormat};
 use crate::VncError;
 
-const TILE_WIDTH: usize = 64;
-const TILE_HEIGHT: usize = 64;
-
-/// Decode TRLE (Tight Raw-Lite Encoding) rectangle.
-///
-/// TRLE is similar to ZRLE but uses Tight-style subencoding.
-/// Each tile is 64x64 and uses one of these subencodings:
-/// - 0: Raw
-/// - 1: Solid
-/// - 2..=17: Packed Palette (2-16 colors, 1/2/4/8 bits per pixel)
-/// - 128: Plain RLE
-/// - 129: Packed Palette RLE
-///
-/// Note: TRLE is rarely used in practice; ZRLE and Tight are preferred.
+/// Decode a TRLE rectangle from the stream into the framebuffer.
 pub fn decode<R: Read>(
     stream: &mut R,
     framebuffer: &mut Framebuffer,
@@ -26,163 +22,7 @@ pub fn decode<R: Read>(
     height: usize,
     pixel_format: &PixelFormat,
 ) -> Result<(), VncError> {
-    let bpp = pixel_format.bytes_per_cpixel();
-    let tiles_x = width.div_ceil(TILE_WIDTH);
-    let tiles_y = height.div_ceil(TILE_HEIGHT);
-
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let tile_x = x + tx * TILE_WIDTH;
-            let tile_y = y + ty * TILE_HEIGHT;
-            let tile_w = (TILE_WIDTH).min(width - tx * TILE_WIDTH);
-            let tile_h = (TILE_HEIGHT).min(height - ty * TILE_HEIGHT);
-
-            decode_tile(
-                stream,
-                framebuffer,
-                tile_x,
-                tile_y,
-                tile_w,
-                tile_h,
-                pixel_format,
-                bpp,
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_tile<R: Read>(
-    stream: &mut R,
-    framebuffer: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    pixel_format: &PixelFormat,
-    bpp: usize,
-) -> Result<(), VncError> {
-    let mut subencoding = [0u8; 1];
-    stream.read_exact(&mut subencoding)?;
-
-    match subencoding[0] {
-        0 => {
-            // TRLE raw tiles use CPIXELs. Decode pixel by pixel because
-            // write_region expects PIXEL-sized bytes.
-            let mut pixel = vec![0u8; bpp];
-            for row in 0..height {
-                for col in 0..width {
-                    stream.read_exact(&mut pixel)?;
-                    let rgba = pixel_format.to_rgba(&pixel);
-                    framebuffer.write_pixel(x + col, y + row, rgba);
-                }
-            }
-        }
-        1 => {
-            // Solid
-            let mut pixel = vec![0u8; bpp];
-            stream.read_exact(&mut pixel)?;
-            let rgba = pixel_format.to_rgba(&pixel);
-            for row in 0..height {
-                for col in 0..width {
-                    framebuffer.write_pixel(x + col, y + row, rgba);
-                }
-            }
-        }
-        2..=16 => {
-            // Packed palette (paletteSize is the subencoding value itself, 2..16).
-            let num_colors = subencoding[0] as usize;
-            let mut palette = vec![vec![0u8; bpp]; num_colors];
-            for color in palette.iter_mut().take(num_colors) {
-                stream.read_exact(color)?;
-            }
-
-            let palette_rgba: Vec<[u8; 4]> = palette
-                .iter()
-                .map(|entry| pixel_format.to_rgba(entry))
-                .collect();
-
-            let bits_per_pixel = if num_colors == 2 {
-                1
-            } else if num_colors <= 4 {
-                2
-            } else if num_colors <= 16 {
-                4
-            } else {
-                8
-            };
-            let pixels_per_byte = 8 / bits_per_pixel;
-            let row_bytes = width.div_ceil(pixels_per_byte);
-
-            for row in 0..height {
-                let mut row_data = vec![0u8; row_bytes];
-                stream.read_exact(&mut row_data)?;
-                for col in 0..width {
-                    let byte_idx = col / pixels_per_byte;
-                    let bit_shift = 8 - bits_per_pixel - (col % pixels_per_byte) * bits_per_pixel;
-                    let mask = (1 << bits_per_pixel) - 1;
-                    let idx = ((row_data[byte_idx] >> bit_shift) & mask) as usize;
-                    if idx < num_colors {
-                        framebuffer.write_pixel(x + col, y + row, palette_rgba[idx]);
-                    }
-                }
-            }
-        }
-        128 => {
-            // Plain RLE
-            let mut pixel = vec![0u8; bpp];
-            let mut col = 0;
-            let mut row = 0;
-            loop {
-                stream.read_exact(&mut pixel)?;
-                let rgba = pixel_format.to_rgba(&pixel);
-
-                let mut run_length_buf = [0u8; 1];
-                stream.read_exact(&mut run_length_buf)?;
-                let mut run_length = run_length_buf[0] as usize;
-
-                if run_length == 0 {
-                    // End of tile marker
-                    break;
-                }
-
-                if run_length == 255 {
-                    // Extended run length
-                    let mut ext_buf = [0u8; 2];
-                    stream.read_exact(&mut ext_buf)?;
-                    run_length = u16::from_be_bytes(ext_buf) as usize;
-                }
-
-                for _ in 0..run_length {
-                    if row < height {
-                        framebuffer.write_pixel(x + col, y + row, rgba);
-                        col += 1;
-                        if col >= width {
-                            col = 0;
-                            row += 1;
-                        }
-                    }
-                }
-            }
-        }
-        129 => {
-            // Packed palette RLE
-            // Similar to ZRLE palette RLE but with TRLE format
-            // For simplicity, treat as unsupported and skip
-            return Err(VncError::Protocol(
-                "TRLE Packed Palette RLE not yet supported".to_string(),
-            ));
-        }
-        _ => {
-            return Err(VncError::Protocol(format!(
-                "TRLE: unknown subencoding {}",
-                subencoding[0]
-            )));
-        }
-    }
-
+    vnc_protocol::zrle::decode_tiles(stream, framebuffer, x, y, width, height, pixel_format)?;
     Ok(())
 }
 
@@ -191,60 +31,115 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    #[test]
-    fn plain_rle_end_of_tile_is_run_length_zero() {
-        // Regression test: a black pixel should not terminate the tile.
-        let mut fb = Framebuffer::new(3, 1);
-        let mut data = vec![128u8]; // plain RLE subencoding
-
-        // red pixel, run length 2
-        data.extend_from_slice(&[0xff, 0x00, 0x00]);
-        data.push(2);
-
-        // black pixel, run length 1
-        data.extend_from_slice(&[0x00, 0x00, 0x00]);
-        data.push(1);
-
-        // end-of-tile marker: any pixel followed by length 0
-        data.extend_from_slice(&[0x00, 0x00, 0x00]);
-        data.push(0);
-
-        decode(
-            &mut Cursor::new(&data),
-            &mut fb,
-            0,
-            0,
-            3,
-            1,
-            &PixelFormat::rgba32(),
-        )
-        .unwrap();
-
-        assert_eq!(&fb.data()[0..4], &[0xff, 0x00, 0x00, 0xff]);
-        assert_eq!(&fb.data()[4..8], &[0xff, 0x00, 0x00, 0xff]);
-        assert_eq!(&fb.data()[8..12], &[0x00, 0x00, 0x00, 0xff]);
+    fn fmt() -> PixelFormat {
+        PixelFormat::rgba32()
     }
 
     #[test]
-    fn plain_rle_zero_pixel_is_drawn() {
-        // A single black pixel should be drawn, not treated as end-of-tile.
-        let mut fb = Framebuffer::new(1, 1);
-        let mut data = vec![128u8];
-        data.extend_from_slice(&[0x00, 0x00, 0x00]);
-        data.push(1);
-        data.extend_from_slice(&[0x00, 0x00, 0x00]);
-        data.push(0);
+    fn raw_tile_3_byte_cpixel() {
+        // 2x1 raw tile: red, green CPIXELs (3 bytes each).
+        let mut fb = Framebuffer::new(2, 1);
+        let data = vec![0u8, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00];
+        decode(&mut Cursor::new(&data), &mut fb, 0, 0, 2, 1, &fmt()).unwrap();
+        assert_eq!(&fb.data()[0..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(&fb.data()[4..8], &[0x00, 0xff, 0x00, 0xff]);
+    }
 
-        decode(
-            &mut Cursor::new(&data),
-            &mut fb,
-            0,
-            0,
-            1,
-            1,
-            &PixelFormat::rgba32(),
-        )
-        .unwrap();
-        assert_eq!(&fb.data()[0..4], &[0x00, 0x00, 0x00, 0xff]);
+    #[test]
+    fn solid_tile() {
+        let mut fb = Framebuffer::new(2, 2);
+        let data = vec![1u8, 0xff, 0x00, 0x00];
+        decode(&mut Cursor::new(&data), &mut fb, 0, 0, 2, 2, &fmt()).unwrap();
+        for i in 0..4 {
+            assert_eq!(&fb.data()[i * 4..i * 4 + 4], &[0xff, 0x00, 0x00, 0xff]);
+        }
+    }
+
+    #[test]
+    fn packed_palette_two_color_scanline_padding() {
+        // 5x2 tile, 2 colours -> 1 bit per pixel, each scanline padded to a
+        // whole byte. Row 0: R G R G R -> 0b01010xxx = 0x50.
+        // Row 1: G R G R G -> 0b10101xxx = 0xa8.
+        let red = [0xff, 0x00, 0x00];
+        let green = [0x00, 0xff, 0x00];
+        let mut data = vec![2u8]; // packed palette, 2 colours
+        data.extend_from_slice(&red);
+        data.extend_from_slice(&green);
+        data.push(0x50);
+        data.push(0xa8);
+
+        let mut fb = Framebuffer::new(5, 2);
+        decode(&mut Cursor::new(&data), &mut fb, 0, 0, 5, 2, &fmt()).unwrap();
+
+        let px = |i: usize| &fb.data()[i * 4..i * 4 + 4];
+        let r = [0xff, 0x00, 0x00, 0xff];
+        let g = [0x00, 0xff, 0x00, 0xff];
+        assert_eq!(px(0), &r);
+        assert_eq!(px(1), &g);
+        assert_eq!(px(2), &r);
+        assert_eq!(px(3), &g);
+        assert_eq!(px(4), &r);
+        assert_eq!(px(5), &g);
+        assert_eq!(px(6), &r);
+        assert_eq!(px(7), &g);
+        assert_eq!(px(8), &r);
+        assert_eq!(px(9), &g);
+    }
+
+    #[test]
+    fn plain_rle_run_length_continuation() {
+        // 64x5 tile = 320 pixels: a run of 300 red pixels followed by a run of
+        // 20 green pixels. Run length 300 -> 299 = 255 + 44 -> [255, 44];
+        // run length 20 -> 19 -> [19].
+        let red = [0xff, 0x00, 0x00];
+        let green = [0x00, 0xff, 0x00];
+        let mut data = vec![128u8]; // plain RLE
+        data.extend_from_slice(&red);
+        data.push(255);
+        data.push(44);
+        data.extend_from_slice(&green);
+        data.push(19);
+
+        let mut fb = Framebuffer::new(64, 5);
+        decode(&mut Cursor::new(&data), &mut fb, 0, 0, 64, 5, &fmt()).unwrap();
+
+        let r = [0xff, 0x00, 0x00, 0xff];
+        let g = [0x00, 0xff, 0x00, 0xff];
+        for i in 0..300 {
+            assert_eq!(&fb.data()[i * 4..i * 4 + 4], &r, "pixel {}", i);
+        }
+        for i in 300..320 {
+            assert_eq!(&fb.data()[i * 4..i * 4 + 4], &g, "pixel {}", i);
+        }
+    }
+
+    #[test]
+    fn palette_rle() {
+        // Palette RLE with 2 colours (subencoding 130): 3 red then 1 green.
+        let red = [0xff, 0x00, 0x00];
+        let green = [0x00, 0xff, 0x00];
+        let mut data = vec![130u8]; // 128 + palette size 2
+        data.extend_from_slice(&red);
+        data.extend_from_slice(&green);
+        // Run of 3 red: index 0 with top bit set, length 3 -> [0x80, 2].
+        data.push(0x80);
+        data.push(2);
+        // Single green: literal index 1.
+        data.push(1);
+
+        let mut fb = Framebuffer::new(4, 1);
+        decode(&mut Cursor::new(&data), &mut fb, 0, 0, 4, 1, &fmt()).unwrap();
+        assert_eq!(&fb.data()[0..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(&fb.data()[4..8], &[0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(&fb.data()[8..12], &[0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(&fb.data()[12..16], &[0x00, 0xff, 0x00, 0xff]);
+    }
+
+    #[test]
+    fn invalid_subencoding_is_rejected() {
+        // Subencodings 17..=127 are invalid per the RFB spec.
+        let mut fb = Framebuffer::new(1, 1);
+        let data = vec![17u8];
+        assert!(decode(&mut Cursor::new(&data), &mut fb, 0, 0, 1, 1, &fmt()).is_err());
     }
 }

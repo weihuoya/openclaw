@@ -1,9 +1,6 @@
-use cipher::block::BlockCipherEncrypt;
-use cipher::Block;
-use des::Des;
-
 use crate::VncError;
-use des::cipher::KeyInit;
+
+use vnc_protocol::encrypt_challenge;
 
 /// Authentication handler trait.
 pub trait AuthHandler {
@@ -184,11 +181,8 @@ impl AuthHandler for PasswordAuthHandler {
         let mut challenge = [0u8; 16];
         stream.read_exact(&mut challenge)?;
 
-        // Derive DES key from password
-        let key = vnc_des_key(&self.password);
-
         // Encrypt challenge with DES-ECB (two independent 8-byte blocks)
-        let response = des_encrypt(&key, &challenge);
+        let response = encrypt_challenge(&challenge, &self.password)?;
         stream.write_all(&response)?;
 
         // Read security result
@@ -201,44 +195,4 @@ impl AuthHandler for PasswordAuthHandler {
 
         Ok(())
     }
-}
-
-/// Derive a VNC DES key from a password.
-/// Password is truncated/padded to 8 bytes, then each byte's bits are reversed.
-fn vnc_des_key(password: &str) -> [u8; 8] {
-    let mut key = [0u8; 8];
-    let pw_bytes = password.as_bytes();
-    let len = pw_bytes.len().min(8);
-    key[..len].copy_from_slice(&pw_bytes[..len]);
-
-    // VNC uses non-standard DES: reverse bits in each key byte
-    for byte in key.iter_mut() {
-        *byte = reverse_bits(*byte);
-    }
-    key
-}
-
-/// Reverse bits in a byte.
-fn reverse_bits(mut b: u8) -> u8 {
-    b = ((b & 0xF0) >> 4) | ((b & 0x0F) << 4);
-    b = ((b & 0xCC) >> 2) | ((b & 0x33) << 2);
-    b = ((b & 0xAA) >> 1) | ((b & 0x55) << 1);
-    b
-}
-
-/// Encrypt two 8-byte blocks with DES-ECB using the given key.
-fn des_encrypt(key: &[u8; 8], data: &[u8; 16]) -> [u8; 16] {
-    let cipher = Des::new_from_slice(key).expect("DES key length is always valid");
-
-    let mut result = [0u8; 16];
-
-    let mut block1: Block<Des> = data[0..8].try_into().unwrap();
-    cipher.encrypt_block(&mut block1);
-    result[0..8].copy_from_slice(&block1);
-
-    let mut block2: Block<Des> = data[8..16].try_into().unwrap();
-    cipher.encrypt_block(&mut block2);
-    result[8..16].copy_from_slice(&block2);
-
-    result
 }

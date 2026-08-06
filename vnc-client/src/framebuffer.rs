@@ -50,178 +50,7 @@ impl Transform {
     }
 }
 
-/// Pixel format description.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PixelFormat {
-    pub bits_per_pixel: u8,
-    pub depth: u8,
-    pub big_endian: bool,
-    pub true_colour: bool,
-    pub red_max: u16,
-    pub green_max: u16,
-    pub blue_max: u16,
-    pub red_shift: u8,
-    pub green_shift: u8,
-    pub blue_shift: u8,
-}
-
-impl PixelFormat {
-    pub fn from_bytes(data: &[u8]) -> Result<Self, crate::VncError> {
-        if data.len() < 16 {
-            return Err(crate::VncError::Protocol(
-                "Pixel format data too short".to_string(),
-            ));
-        }
-
-        Ok(Self {
-            bits_per_pixel: data[0],
-            depth: data[1],
-            big_endian: data[2] != 0,
-            true_colour: data[3] != 0,
-            red_max: u16::from_be_bytes([data[4], data[5]]),
-            green_max: u16::from_be_bytes([data[6], data[7]]),
-            blue_max: u16::from_be_bytes([data[8], data[9]]),
-            red_shift: data[10],
-            green_shift: data[11],
-            blue_shift: data[12],
-        })
-    }
-
-    pub fn write_to(&self, buf: &mut [u8]) {
-        buf[0] = self.bits_per_pixel;
-        buf[1] = self.depth;
-        buf[2] = if self.big_endian { 1 } else { 0 };
-        buf[3] = if self.true_colour { 1 } else { 0 };
-        buf[4..6].copy_from_slice(&self.red_max.to_be_bytes());
-        buf[6..8].copy_from_slice(&self.green_max.to_be_bytes());
-        buf[8..10].copy_from_slice(&self.blue_max.to_be_bytes());
-        buf[10] = self.red_shift;
-        buf[11] = self.green_shift;
-        buf[12] = self.blue_shift;
-        // buf[13..16] padding - caller must ensure zeros
-    }
-
-    /// 32-bit little-endian RGBA.
-    pub fn rgba32() -> Self {
-        Self {
-            bits_per_pixel: 32,
-            depth: 24,
-            big_endian: false,
-            true_colour: true,
-            red_max: 255,
-            green_max: 255,
-            blue_max: 255,
-            red_shift: 0,
-            green_shift: 8,
-            blue_shift: 16,
-        }
-    }
-
-    /// 32-bit little-endian BGRA (common VNC server default).
-    pub fn bgra32() -> Self {
-        Self {
-            bits_per_pixel: 32,
-            depth: 24,
-            big_endian: false,
-            true_colour: true,
-            red_max: 255,
-            green_max: 255,
-            blue_max: 255,
-            red_shift: 16,
-            green_shift: 8,
-            blue_shift: 0,
-        }
-    }
-
-    pub fn rgb16() -> Self {
-        Self {
-            bits_per_pixel: 16,
-            depth: 16,
-            big_endian: false,
-            true_colour: true,
-            red_max: 31,
-            green_max: 63,
-            blue_max: 31,
-            red_shift: 11,
-            green_shift: 5,
-            blue_shift: 0,
-        }
-    }
-
-    pub fn bytes_per_pixel(&self) -> usize {
-        (self.bits_per_pixel as usize).div_ceil(8)
-    }
-
-    /// Number of bytes in a colour pixel (CPIXEL) as used by ZRLE/TRLE/Tight
-    /// encodings. For 32-bit formats, only the colour bytes are sent when the
-    /// depth is 24 or less, so CPIXEL is 3 bytes; otherwise 4 bytes.
-    pub fn bytes_per_cpixel(&self) -> usize {
-        match self.bits_per_pixel {
-            8 => 1,
-            16 => 2,
-            32 => {
-                if self.depth <= 24 {
-                    3
-                } else {
-                    4
-                }
-            }
-            _ => self.bytes_per_pixel(),
-        }
-    }
-
-    /// Convert a pixel from this format to RGBA8888 (little-endian: 0xAABBGGRR in memory).
-    /// `src` must contain the pixel bytes in either the wire format (CPIXEL) or the full
-    /// framebuffer format (PIXEL). Commonly this is 1, 2, 3, or 4 bytes.
-    pub fn to_rgba(&self, src: &[u8]) -> [u8; 4] {
-        let pixel = if self.big_endian {
-            match src.len() {
-                1 => src[0] as u32,
-                2 => u16::from_be_bytes([src[0], src[1]]) as u32,
-                3 => u32::from_be_bytes([0, src[0], src[1], src[2]]),
-                4 => u32::from_be_bytes([src[0], src[1], src[2], src[3]]),
-                _ => 0,
-            }
-        } else {
-            match src.len() {
-                1 => src[0] as u32,
-                2 => u16::from_le_bytes([src[0], src[1]]) as u32,
-                3 => u32::from_le_bytes([src[0], src[1], src[2], 0]),
-                4 => u32::from_le_bytes([src[0], src[1], src[2], src[3]]),
-                _ => 0,
-            }
-        };
-
-        let r = if self.red_max > 0 {
-            let v = ((pixel >> self.red_shift) & self.red_max as u32) as u16;
-            ((v * 255 + self.red_max / 2) / self.red_max) as u8
-        } else {
-            0
-        };
-
-        let g = if self.green_max > 0 {
-            let v = ((pixel >> self.green_shift) & self.green_max as u32) as u16;
-            ((v * 255 + self.green_max / 2) / self.green_max) as u8
-        } else {
-            0
-        };
-
-        let b = if self.blue_max > 0 {
-            let v = ((pixel >> self.blue_shift) & self.blue_max as u32) as u16;
-            ((v * 255 + self.blue_max / 2) / self.blue_max) as u8
-        } else {
-            0
-        };
-
-        [r, g, b, 0xff]
-    }
-}
-
-impl Default for PixelFormat {
-    fn default() -> Self {
-        Self::rgba32()
-    }
-}
+pub use vnc_protocol::PixelFormat;
 
 /// Framebuffer storage (always RGBA8888 internally).
 pub struct Framebuffer {
@@ -347,7 +176,28 @@ impl Framebuffer {
             self.data[offset..offset + 4].copy_from_slice(&rgba);
         }
     }
+}
 
+impl vnc_protocol::PixelSink for Framebuffer {
+    fn write_pixel(&mut self, x: usize, y: usize, rgba: [u8; 4]) {
+        Framebuffer::write_pixel(self, x, y, rgba);
+    }
+
+    fn write_region(&mut self, x: u16, y: u16, w: u16, h: u16, rgba: &[u8]) {
+        // The sink receives RGBA8888, which hits the bulk-copy fast path.
+        Framebuffer::write_region(
+            self,
+            x as usize,
+            y as usize,
+            w as usize,
+            h as usize,
+            rgba,
+            &PixelFormat::rgba32(),
+        );
+    }
+}
+
+impl Framebuffer {
     /// Copy a rectangle from one location to another.
     pub fn copy_rect(
         &mut self,

@@ -11,11 +11,11 @@ This document tracks the implementation of a VNC server in Rust, based on the RF
 ### Phase 1: Core Protocol (Handshake & Session Management)
 - [x] TCP listener and client connection handling
 - [x] Protocol version exchange (`RFB 003.008\n`)
-- [x] Security type negotiation (None, VNC Auth with DES challenge-response)
+- [x] Security type negotiation (None, VNC Auth with DES challenge-response, RSA-AES / RSA-AES-256 with AES-CTR stream encryption)
 - [x] Client initialization (shared flag handling)
 - [x] Server initialization (framebuffer dimensions, pixel format, desktop name)
 - [x] Client state machine
-  - `WaitingForVersion` -> `WaitingForSecurity` -> `WaitingForVncAuth` -> `WaitingForInit` -> `Ready`
+  - `WaitingForVersion` -> `WaitingForSecurity` -> `WaitingForVncAuth` / `WaitingForRsaAes` -> `WaitingForInit` -> `Ready`
 - [x] Per-client statistics (bytes sent/received, frames sent, connection time)
 
 ### Phase 2: Client -> Server Messages
@@ -23,33 +23,34 @@ This document tracks the implementation of a VNC server in Rust, based on the RF
 - [x] `SetEncodings` (type 2) — encoding negotiation
 - [x] `FramebufferUpdateRequest` (type 3) — incremental/full updates
 - [x] `KeyEvent` (type 4) — keysym-based input
-- [x] `PointerEvent` (type 5) — mouse/absolute pointer
+- [x] `PointerEvent` (type 5) — mouse/absolute pointer, including extended mouse buttons
 - [x] `ClientCutText` (type 6) — clipboard receive
 - [x] `EnableContinuousUpdates` (type 150)
 - [x] `Fence` (type 248)
-- [ ] `QEMU Extended Key Event` (type 255, subtype 0)
-- [ ] `SetDesktopSize` (type 251)
+- [x] `QEMU Extended Key Event` (type 255, subtype 0) — Linux keycode + keysym
+- [x] `SetDesktopSize` (type 251) — client-requested resize via `wlr_output_management`
 
 ### Phase 3: Server -> Client Messages
 - [x] `FramebufferUpdate` (type 0) — with rectangle headers
-- [ ] `SetColorMapEntries` (type 1) — for palette modes
-- [ ] `Bell` (type 2)
+- [x] `SetColorMapEntries` (type 1) — for palette modes
+- [x] `Bell` (type 2)
 - [x] `ServerCutText` (type 3) — clipboard send
 - [x] `EndOfContinuousUpdates` (type 150)
-- [x] `Fence` (type 248) — for latency measurement
+- [x] `Fence` (type 248) — ping/pong for latency measurement and bandwidth estimation
 
 ### Phase 4: Encodings
-- [x] `Raw` (0) — baseline, uncompressed
-- [ ] `CopyRect` (1) — copy existing framebuffer region
-- [ ] `RRE` (2) — rise-and-run encoding
+- [x] `Raw` (0) — baseline, uncompressed, with client pixel format conversion
+- [x] `CopyRect` (1) — copy existing framebuffer region, detected via per-tile hash matching against the previous frame
+- [x] `RRE` (2) — rise-and-run encoding
 - [x] `Hextile` (5) — tiled encoding
-- [x] `Tight` (7) — zlib-compressed tiles with Fill/Basic subencodings
+- [x] `Tight` (7) — zlib-compressed tiles with Fill/Basic subencodings; JPEG subencoding for photo/video regions
 - [x] `ZRLE` (16) — zlib-run-length encoding
-- [ ] `TRLE` (15) — tiled RLE
+- [x] `TRLE` (15) — tiled RLE
 - [ ] `Cursor` (-239) — pseudo-encoding for cursor shape (requires ext-image-copy-capture)
 - [x] `DesktopSize` (-223) — desktop resize notification
 - [x] `ExtendedDesktopSize` (-308) — multi-monitor layout
 - [x] `ExtendedClipboard` (-1063131698) — bidirectional clipboard
+- [x] `ExtMouseButtons` (-316) — extended mouse buttons (wheel, side buttons)
 
 ### Phase 5: Wayland Integration
 - [x] `wlr-screencopy-unstable-v1` — screen capture
@@ -61,15 +62,16 @@ This document tracks the implementation of a VNC server in Rust, based on the RF
 
 ### Phase 6: Authentication & Security
 - [x] Password-based VNC auth (DES challenge-response)
-- [ ] RSA-AES key exchange
+- [x] RSA-AES (type 5) / RSA-AES-256 (type 129) key exchange with AES-CTR stream encryption
 - [ ] TLS / VeNCrypt
 - [ ] Username + password credentials
 
 ### Phase 7: Control Interface (wayvncctl equivalent)
 - [x] Unix domain socket IPC
 - [x] JSON command protocol
-- [x] Commands: status, disconnect-client, set-output
-- [x] Commands: reload-config, set-password, set-rate
+- [x] Commands: status, disconnect-client, set-output, reload-config, set-password, set-rate, set-latency, client-list, output-list, version, exit
+- [x] Runtime `set-output` takes effect immediately (re-creates capture and notifies clients)
+- [x] Bandwidth metrics exposed via `status`
 
 ### Phase 8: Performance & Features
 - [x] Damage tracking (tile-based, 64x64)
@@ -77,8 +79,10 @@ This document tracks the implementation of a VNC server in Rust, based on the RF
 - [x] SHM capture with mmap synchronization
 - [x] Per-client traffic statistics (bytes sent/received, frames)
 - [x] Continuous updates mode
-- [ ] Bandwidth estimation
-- [ ] Multi-output / desktop capture switch at runtime
+- [x] Performance counters (capture/encode/send timings, periodic logging, control status)
+- [x] Bandwidth estimation (Fence RTT based, conservative min-filter, inflight byte tracking)
+- [x] Adaptive frame skipping when inflight bytes exceed bandwidth × target latency
+- [x] Multi-output / desktop capture switch at runtime (single output only, via control interface)
 - [ ] Cursor overlay / independent cursor capture
 - [ ] DMA-BUF zero-copy path (future)
 
@@ -105,6 +109,9 @@ blue_shift: 0
 vnc-server/src/
 ├── main.rs           # Entry point, CLI, event loop
 ├── lib.rs            # Module exports
+├── auth/             # Authentication handlers
+│   ├── mod.rs        # VNC password (DES challenge-response)
+│   └── rsa_aes.rs    # RSA-AES / RSA-AES-256 handshake + AES-CTR stream
 ├── server/           # TCP server and client management
 │   ├── mod.rs
 │   ├── listener.rs   # TcpListener + accept loop
@@ -113,9 +120,12 @@ vnc-server/src/
 │   └── mod.rs        # Message types, pixel format, encodings, constants
 ├── encode/           # Frame encoders
 │   ├── mod.rs
-│   ├── raw.rs        # Raw encoding (encoding type 0)
+│   ├── copyrect.rs  # CopyRect encoding (encoding type 1)
+│   ├── raw.rs        # Raw encoding (encoding type 0), with pixel format conversion
 │   ├── hextile.rs    # Hextile encoding (encoding type 5)
-│   ├── tight.rs      # Tight encoding (encoding type 7)
+│   ├── rre.rs        # RRE encoding (encoding type 2)
+│   ├── tight.rs      # Tight encoding (encoding type 7), with JPEG subencoding
+│   ├── trle.rs       # TRLE encoding (encoding type 15)
 │   └── zrle.rs       # ZRLE encoding (encoding type 16)
 ├── wayland/          # Wayland integration
 │   ├── mod.rs
@@ -126,6 +136,8 @@ vnc-server/src/
 │   └── keyboard.rs   # Virtual keyboard (uinput/evdev)
 ├── clipboard.rs      # wlr-data-control stub
 ├── config.rs         # Config file + CLI parsing
+├── perf.rs           # Performance counters and periodic logging
+├── bandwidth.rs      # Bandwidth estimation and adaptive frame skipping
 └── signal.rs         # Signal handling
 ```
 
@@ -160,11 +172,11 @@ VNC Client
 
 ## Known Issues / TODOs
 
-- **Keyboard keysym mapping:** Simplified X11->Linux keycode mapping in `keyboard.rs`. Needs xkbcommon for full accuracy.
+- **Keyboard keysym mapping:** Simplified X11->Linux keycode mapping in `keyboard.rs`. The QEMU extended key event path can send raw Linux keycodes directly, bypassing the keysym map.
 - **Cursor:** Not implemented. No cursor overlay or independent cursor capture.
-- **Multi-output:** Can only capture one output at a time. No desktop switching.
-- **RSA-AES / VeNCrypt / TLS:** Not implemented. Only None and VNC Auth security types are functional.
-- **Control interface:** Implemented via JSON Unix socket; runtime `set-password`, `set-rate`, and `set-output` are wired.
+- **Multi-output:** Can only capture one output at a time, but outputs can be switched at runtime via the control interface.
+- **VeNCrypt / TLS:** Not implemented. None, VNC Auth, and RSA-AES/RSA-AES-256 security types are functional.
+- **Control interface:** Implemented via JSON Unix socket; runtime `set-password`, `set-rate`, `set-output`, `client-list`, `output-list`, `version`, and `exit` are wired.
 
 ## Compilation Status
 

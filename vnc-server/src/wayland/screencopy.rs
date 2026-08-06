@@ -34,6 +34,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for WaylandState {
             }
             wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::Event::BufferDone => {
                 log::debug!("Frame buffer done");
+                state.capture_buffer_done = true;
             }
             wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::Event::Flags { .. } => {}
             wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::Event::Ready { .. } => {

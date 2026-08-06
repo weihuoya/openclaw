@@ -1,28 +1,24 @@
+//! VeNCrypt security type handler.
+//!
+//! The wire framing (version bytes, sub-type numbers, message layout) is
+//! shared in [`vnc_protocol::vencrypt`]; this module keeps the client-side
+//! negotiation policy (sub-type preference) and maps the selected sub-type
+//! to a [`VencryptResult`].
+//!
+//! VeNCrypt protocol flow:
+//! 1. Server sends VeNCrypt version (major.minor)
+//! 2. Client replies with chosen version
+//! 3. Server sends supported sub-types
+//! 4. Client selects a sub-type
+//! 5. Perform authentication per sub-type
+//! 6. Server sends security result
+
 use std::io::{Read, Write};
+
+use vnc_protocol::vencrypt::{self, VeNCryptSubType};
 
 use crate::VncError;
 
-/// VeNCrypt security type handler.
-///
-/// VeNCrypt protocol flow:
-/// 1. Server sends VeNCrypt version (major.minor)
-/// 2. Client replies with chosen version
-/// 3. Server sends supported sub-types
-/// 4. Client selects a sub-type
-/// 5. Perform authentication per sub-type
-/// 6. Server sends security result
-///
-/// Sub-types:
-/// - 0:  None (no auth)
-/// - 1:  VNC Auth (DES password)
-/// - 2:  TLS
-/// - 256: TLS + X509 certificate
-/// - 257: TLS + X509 certificate with username
-/// - 22: SASL
-/// - 24: SASL + anon
-/// - 26: RSA-AES
-/// - 27: RSA-AES-256
-/// - 30: Apple Diffie-Hellman
 pub struct VencryptHandler;
 
 impl VencryptHandler {
@@ -30,10 +26,9 @@ impl VencryptHandler {
         // Read VeNCrypt version
         let mut buf = [0u8; 2];
         stream.read_exact(&mut buf)?;
-        let major = buf[0];
-        let minor = buf[1];
+        let (major, minor) = (buf[0], buf[1]);
 
-        if major != 0 || minor < 2 {
+        if !vencrypt::version_supported(major, minor) {
             return Err(VncError::Protocol(format!(
                 "Unsupported VeNCrypt version: {}.{}",
                 major, minor
@@ -41,7 +36,7 @@ impl VencryptHandler {
         }
 
         // Reply with same version
-        stream.write_all(&[0, 2])?;
+        stream.write_all(&vencrypt::VERSION_0_2)?;
 
         // Read number of sub-types
         let mut buf = [0u8; 1];
@@ -62,37 +57,38 @@ impl VencryptHandler {
 
         // Preference: strongest first, weakest last.
         let preferred = [
-            2u32, // TLS
-            27,   // RSA-AES-256
-            26,   // RSA-AES
-            256,  // X509
-            22,   // SASL
-            30,   // Apple DH (functional but uses ECB/MD5; kept as fallback)
-            0,    // None
-            1,    // VNCAuth
+            VeNCryptSubType::Tls,
+            VeNCryptSubType::RsaAes256,
+            VeNCryptSubType::RsaAes,
+            VeNCryptSubType::X509,
+            VeNCryptSubType::Sasl,
+            // Apple DH is functional but uses ECB/MD5; kept as fallback.
+            VeNCryptSubType::AppleDh,
+            VeNCryptSubType::Plain,
+            VeNCryptSubType::VncAuth,
         ];
 
         let selected = preferred
             .iter()
-            .find(|&&p| subtypes.contains(&p))
+            .find(|p| subtypes.contains(&(**p as u32)))
             .copied()
             .ok_or_else(|| VncError::AuthFailed("No supported VeNCrypt sub-type".to_string()))?;
 
         // Send selected sub-type
-        stream.write_all(&selected.to_be_bytes())?;
+        stream.write_all(&(selected as u32).to_be_bytes())?;
 
         match selected {
-            2 => Ok(VencryptResult::Tls),
-            256 => Ok(VencryptResult::X509),
-            0 => Ok(VencryptResult::None),
-            1 => Ok(VencryptResult::VncAuth),
-            26 => Ok(VencryptResult::RsaAes),
-            27 => Ok(VencryptResult::RsaAes256),
-            30 => Ok(VencryptResult::AppleDh),
-            22 => Ok(VencryptResult::Sasl),
-            _ => Err(VncError::Protocol(format!(
+            VeNCryptSubType::Tls => Ok(VencryptResult::Tls),
+            VeNCryptSubType::X509 => Ok(VencryptResult::X509),
+            VeNCryptSubType::Plain => Ok(VencryptResult::None),
+            VeNCryptSubType::VncAuth => Ok(VencryptResult::VncAuth),
+            VeNCryptSubType::RsaAes => Ok(VencryptResult::RsaAes),
+            VeNCryptSubType::RsaAes256 => Ok(VencryptResult::RsaAes256),
+            VeNCryptSubType::AppleDh => Ok(VencryptResult::AppleDh),
+            VeNCryptSubType::Sasl => Ok(VencryptResult::Sasl),
+            other => Err(VncError::Protocol(format!(
                 "Unknown VeNCrypt sub-type: {}",
-                selected
+                other as u32
             ))),
         }
     }

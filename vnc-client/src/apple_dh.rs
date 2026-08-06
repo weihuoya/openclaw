@@ -118,17 +118,7 @@ impl AppleDhAuth {
         );
         let aes_key = md5::compute(&shared_bytes);
         let wrap_key = aes_key.0;
-        log::debug!(
-            "Apple DH shared secret ({} B): head={:02x?}, tail={:02x?}",
-            shared_bytes.len(),
-            &shared_bytes[..shared_bytes.len().min(4)],
-            &shared_bytes[shared_bytes.len().saturating_sub(4)..]
-        );
-        log::debug!(
-            "Apple DH wrap key (MD5): head={:02x?}, tail={:02x?}",
-            &wrap_key[..4],
-            &wrap_key[12..]
-        );
+        log::debug!("Apple DH wrap key derived via MD5");
 
         // Build 128-byte credential blob and encrypt it with AES-128-ECB.
         let mut blob = build_credential_blob(&self.username, &self.password, &mut rng);

@@ -114,8 +114,13 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for WaylandState {
                         });
                         if has_text {
                             log::debug!("Clipboard selection has text, requesting...");
-                            let (read_fd, write_fd) = nix::unistd::pipe()
-                                .expect("Failed to create pipe for clipboard");
+                            let (read_fd, write_fd) = match nix::unistd::pipe() {
+                                Ok(pair) => pair,
+                                Err(e) => {
+                                    log::warn!("Failed to create pipe for clipboard: {}", e);
+                                    return;
+                                }
+                            };
 
                             // Use text/plain as the preferred mime type
                             offer.receive("text/plain".to_string(), write_fd.as_fd());

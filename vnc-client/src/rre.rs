@@ -1,19 +1,15 @@
+//! RRE (Rise-and-Run-length Encoding) decoder, encoding type 2.
+//!
+//! The RRE decode logic is shared in [`vnc_protocol::rre::decode`]; this
+//! module provides the client-specific wrapper that targets a `Framebuffer`.
+
 use std::io::Read;
 
 use crate::framebuffer::{Framebuffer, PixelFormat};
 use crate::VncError;
 
-/// Decode RRE (Rise-and-Run-length Encoding) rectangle.
-///
-/// Format:
-/// - u32: number of sub-rectangles
-/// - pixel_value: background pixel (bpp bytes)
-/// - For each sub-rectangle:
-///   - pixel_value: foreground pixel (bpp bytes)
-///   - u16: x
-///   - u16: y
-///   - u16: width
-///   - u16: height
+/// Decode an RRE-encoded rectangle from the stream into the framebuffer.
+#[allow(clippy::too_many_arguments)]
 pub fn decode<R: Read>(
     stream: &mut R,
     framebuffer: &mut Framebuffer,
@@ -23,44 +19,7 @@ pub fn decode<R: Read>(
     height: usize,
     pixel_format: &PixelFormat,
 ) -> Result<(), VncError> {
-    let bpp = pixel_format.bytes_per_pixel();
-
-    let mut buf = [0u8; 4];
-    stream.read_exact(&mut buf)?;
-    let num_subrects = u32::from_be_bytes(buf);
-
-    // Read background pixel
-    let mut bg_pixel = vec![0u8; bpp];
-    stream.read_exact(&mut bg_pixel)?;
-    let bg = pixel_format.to_rgba(&bg_pixel);
-
-    // Fill entire rectangle with background
-    for row in 0..height {
-        for col in 0..width {
-            framebuffer.write_pixel(x + col, y + row, bg);
-        }
-    }
-
-    // Read and draw sub-rectangles
-    for _ in 0..num_subrects {
-        let mut fg_pixel = vec![0u8; bpp];
-        stream.read_exact(&mut fg_pixel)?;
-        let fg = pixel_format.to_rgba(&fg_pixel);
-
-        let mut rect_buf = [0u8; 8];
-        stream.read_exact(&mut rect_buf)?;
-        let sx = u16::from_be_bytes([rect_buf[0], rect_buf[1]]) as usize;
-        let sy = u16::from_be_bytes([rect_buf[2], rect_buf[3]]) as usize;
-        let sw = u16::from_be_bytes([rect_buf[4], rect_buf[5]]) as usize;
-        let sh = u16::from_be_bytes([rect_buf[6], rect_buf[7]]) as usize;
-
-        for row in 0..sh {
-            for col in 0..sw {
-                framebuffer.write_pixel(x + sx + col, y + sy + row, fg);
-            }
-        }
-    }
-
+    vnc_protocol::rre::decode(stream, framebuffer, x, y, width, height, pixel_format)?;
     Ok(())
 }
 

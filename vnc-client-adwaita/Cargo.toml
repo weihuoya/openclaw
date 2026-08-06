@@ -21,3 +21,5 @@ vnc-widget-gtk4 = { path = "../vnc-widget-gtk4" }
 log = "0.4"
 env_logger = "0.11"
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
