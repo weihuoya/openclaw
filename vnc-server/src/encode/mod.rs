@@ -1,6 +1,7 @@
 pub mod copyrect;
 pub mod cursor;
 pub mod hextile;
+pub mod openh264;
 pub mod raw;
 pub mod rre;
 pub mod tight;

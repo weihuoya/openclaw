@@ -1,9 +1,22 @@
-//! Virtual keyboard input via Linux uinput.
+//! Virtual keyboard input backends.
 //!
-//! This module provides keyboard input injection using the Linux uinput
-//! subsystem, which works independently of the Wayland compositor.
+//! Provides two implementations:
+//! - `VirtualKeyboard` (Linux uinput): requires root, works with any compositor
+//! - `WaylandVirtualKeyboard` (zwp-virtual-keyboard-v1): no root needed, requires compositor support
 
 use log::{debug, error, warn};
+
+/// Trait for keyboard input backends.
+pub trait KeyboardBackend {
+    /// Send a key event using a Linux keycode.
+    fn key(&mut self, keycode: u32, pressed: bool);
+
+    /// Send a keysym (X11 keysym) event.
+    fn keysym(&mut self, keysym: u32, pressed: bool);
+}
+
+// Re-export the Wayland backend from its module.
+pub use crate::wayland::virtual_keyboard_wayland::WaylandVirtualKeyboard;
 
 /// Linux keycode for the left Shift key (KEY_LEFTSHIFT).
 const KEY_LEFTSHIFT: u16 = 42;
@@ -83,6 +96,16 @@ impl VirtualKeyboard {
                 error!("Failed to emit key event: {}", e);
             }
         }
+    }
+}
+
+impl KeyboardBackend for VirtualKeyboard {
+    fn key(&mut self, keycode: u32, pressed: bool) {
+        self.key(keycode, pressed);
+    }
+
+    fn keysym(&mut self, keysym: u32, pressed: bool) {
+        self.keysym(keysym, pressed);
     }
 }
 

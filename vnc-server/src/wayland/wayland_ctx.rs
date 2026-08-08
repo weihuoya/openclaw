@@ -10,6 +10,8 @@ use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::{wl_compositor, wl_output, wl_registry, wl_seat, wl_shm};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_manager_v1::ZwlrDataControlManagerV1;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::ZwlrOutputConfigurationV1;
@@ -48,6 +50,7 @@ pub struct WaylandState {
     pub screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     pub data_control_manager: Option<ZwlrDataControlManagerV1>,
+    pub virtual_keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
     pub output_manager: Option<ZwlrOutputManagerV1>,
     /// wlr_output_management heads discovered by the compositor.
     pub output_heads: Vec<OutputHead>,
@@ -101,6 +104,7 @@ impl WaylandState {
             screencopy_manager: None,
             virtual_pointer_manager: None,
             data_control_manager: None,
+            virtual_keyboard_manager: None,
             output_manager: None,
             output_heads: Vec::new(),
             output_manager_serial: 0,
@@ -282,6 +286,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                         (),
                     );
                     state.data_control_manager = Some(manager);
+                }
+                "zwp_virtual_keyboard_manager_v1" => {
+                    let manager = registry.bind::<ZwpVirtualKeyboardManagerV1, _, _>(
+                        name,
+                        version.min(1),
+                        qh,
+                        (),
+                    );
+                    state.virtual_keyboard_manager = Some(manager);
                 }
                 "zwlr_output_manager_v1" => {
                     let manager =
@@ -465,5 +478,7 @@ stub_dispatch!(WlBuffer);
 stub_dispatch!(ZwlrScreencopyManagerV1);
 stub_dispatch!(ZwlrVirtualPointerManagerV1);
 stub_dispatch!(ZwlrDataControlManagerV1);
+stub_dispatch!(ZwpVirtualKeyboardManagerV1);
+stub_dispatch!(ZwpVirtualKeyboardV1);
 stub_dispatch!(ZwlrOutputModeV1);
 stub_dispatch!(ZwlrOutputConfigurationHeadV1);

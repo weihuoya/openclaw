@@ -292,7 +292,9 @@ fn main() {
 
     // Setup virtual input devices
     let mut virtual_pointer: Option<VirtualPointer> = None;
-    let mut virtual_keyboard: Option<VirtualKeyboard> = None;
+    let mut virtual_keyboard: Option<
+        Box<dyn vnc_server::wayland::keyboard::KeyboardBackend + Send>,
+    > = None;
 
     if !config.disable_input {
         if let Some(vp_mgr) = wayland.virtual_pointer_manager.as_ref() {
@@ -301,13 +303,36 @@ fn main() {
                 info!("Virtual pointer created");
             }
         }
-        match VirtualKeyboard::new() {
-            Ok(vk) => {
-                virtual_keyboard = Some(vk);
-                info!("Virtual keyboard created");
+        // Try Wayland virtual keyboard first (no root required), then fall back to uinput.
+        if let Some(vk_mgr) = wayland.virtual_keyboard_manager.as_ref() {
+            if let Some(seat) = wayland.seats.first() {
+                match vnc_server::wayland::virtual_keyboard_wayland::WaylandVirtualKeyboard::new(
+                    vk_mgr,
+                    &seat.wl_seat,
+                    &qh,
+                ) {
+                    Ok(vk) => {
+                        virtual_keyboard = Some(Box::new(vk));
+                        info!("Wayland virtual keyboard created (no root required)");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Wayland virtual keyboard unavailable ({}), falling back to uinput",
+                            e
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                warn!("Failed to create virtual keyboard: {}", e);
+        }
+        if virtual_keyboard.is_none() {
+            match VirtualKeyboard::new() {
+                Ok(vk) => {
+                    virtual_keyboard = Some(Box::new(vk));
+                    info!("Virtual keyboard created (uinput)");
+                }
+                Err(e) => {
+                    warn!("Failed to create virtual keyboard: {}", e);
+                }
             }
         }
     }
@@ -739,6 +764,8 @@ fn main() {
                     let use_trle = client.has_encoding(Encoding::Trle);
                     let use_zlib = client.has_encoding(Encoding::Zlib);
                     let use_rre = client.has_encoding(Encoding::Rre);
+                    let use_openh264 = client.has_encoding(Encoding::OpenH264)
+                        && client.openh264_encoder.is_some();
                     if let Err(e) = client.send_fb_update_header(total_rects as u16) {
                         warn!("Send header failed: {}", e);
                         continue;
@@ -765,7 +792,21 @@ fn main() {
 
                     if send_ok {
                         for rect in &damage_rects_to_send {
-                            let enc_rect = if use_tight {
+                            let enc_rect = if use_openh264 {
+                                if let Some(ref mut encoder) = client.openh264_encoder {
+                                    encoder.encode(
+                                        &fb.data,
+                                        stride,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &client.pixel_format,
+                                    )
+                                } else {
+                                    unreachable!()
+                                }
+                            } else if use_tight {
                                 client.tight_encoder.encode(
                                     &fb.data,
                                     stride,
@@ -836,7 +877,9 @@ fn main() {
                                     &client.pixel_format,
                                 )
                             };
-                            let send_result = if use_tight {
+                            let send_result = if use_openh264 {
+                                client.send_openh264_rect(&enc_rect)
+                            } else if use_tight {
                                 client.send_tight_rect(&enc_rect)
                             } else if use_zrle {
                                 client.send_zrle_rect(&enc_rect)

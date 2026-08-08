@@ -46,7 +46,9 @@ This document tracks the implementation of a VNC server in Rust, based on the RF
 - [x] `Tight` (7) — zlib-compressed tiles with Fill/Basic subencodings; JPEG subencoding for photo/video regions
 - [x] `ZRLE` (16) — zlib-run-length encoding
 - [x] `TRLE` (15) — tiled RLE
-- [ ] `Cursor` (-239) — pseudo-encoding for cursor shape (requires ext-image-copy-capture)
+- [x] `OpenH264` (50) — H.264 video encoding via Cisco OpenH264
+- [x] `Cursor` (-239) — pseudo-encoding for cursor shape and position
+- [x] `CursorPos` (-239) — cursor position updates
 - [x] `DesktopSize` (-223) — desktop resize notification
 - [x] `ExtendedDesktopSize` (-308) — multi-monitor layout
 - [x] `ExtendedClipboard` (-1063131698) — bidirectional clipboard
@@ -56,15 +58,15 @@ This document tracks the implementation of a VNC server in Rust, based on the RF
 - [x] `wlr-screencopy-unstable-v1` — screen capture
 - [x] `wl_output` / `wl_seat` discovery
 - [x] `zwlr-virtual-pointer-v1` — virtual mouse input
-- [x] `uinput` / `evdev` — virtual keyboard input
+- [x] `uinput` / `evdev` — virtual keyboard input (fallback, requires root)
+- [x] `zwp-virtual-keyboard-v1` — Wayland virtual keyboard (preferred, no root required)
 - [x] `zwlr-data-control-v1` — bidirectional clipboard sync
-- [ ] `zwp-virtual-keyboard-v1` — Wayland virtual keyboard (alternative to uinput)
 
 ### Phase 6: Authentication & Security
 - [x] Password-based VNC auth (DES challenge-response)
 - [x] RSA-AES (type 5) / RSA-AES-256 (type 129) key exchange with AES-CTR stream encryption
-- [ ] TLS / VeNCrypt
-- [ ] Username + password credentials
+- [x] TLS / VeNCrypt (self-signed certificate or user-provided PEM)
+- [x] Username + password credentials (for VeNCrypt)
 
 ### Phase 7: Control Interface (wayvncctl equivalent)
 - [x] Unix domain socket IPC
@@ -133,7 +135,8 @@ vnc-server/src/
 │   ├── capture.rs    # CaptureManager + FrameData
 │   ├── screencopy.rs # wlr-screencopy dispatch
 │   ├── input.rs      # Virtual pointer (wlr-virtual-pointer)
-│   └── keyboard.rs   # Virtual keyboard (uinput/evdev)
+│   ├── keyboard.rs   # Virtual keyboard trait + uinput implementation
+│   └── virtual_keyboard_wayland.rs # Wayland virtual keyboard (zwp-virtual-keyboard-v1)
 ├── clipboard.rs      # wlr-data-control stub
 ├── config.rs         # Config file + CLI parsing
 ├── perf.rs           # Performance counters and periodic logging
@@ -172,11 +175,9 @@ VNC Client
 
 ## Known Issues / TODOs
 
-- **Keyboard keysym mapping:** Simplified X11->Linux keycode mapping in `keyboard.rs`. The QEMU extended key event path can send raw Linux keycodes directly, bypassing the keysym map.
-- **Cursor:** Not implemented. No cursor overlay or independent cursor capture.
+- **Keyboard keysym mapping:** Simplified X11->Linux keycode mapping in `keyboard.rs` and `virtual_keyboard_wayland.rs`. The QEMU extended key event path can send raw Linux keycodes directly, bypassing the keysym map.
 - **Multi-output:** Can only capture one output at a time, but outputs can be switched at runtime via the control interface.
-- **VeNCrypt / TLS:** Not implemented. None, VNC Auth, and RSA-AES/RSA-AES-256 security types are functional.
-- **Control interface:** Implemented via JSON Unix socket; runtime `set-password`, `set-rate`, `set-output`, `client-list`, `output-list`, `version`, and `exit` are wired.
+- **DMA-BUF zero-copy path:** Not implemented (future optimization).
 
 ## Compilation Status
 
@@ -199,4 +200,4 @@ VNC Client
 
 ---
 
-*Last updated: 2026-08-04*
+*Last updated: 2026-08-08*

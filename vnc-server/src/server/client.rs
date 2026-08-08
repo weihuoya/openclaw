@@ -286,6 +286,7 @@ pub struct VncClient {
     pub tight_encoder: TightEncoder,
     pub zlib_encoder: ZlibEncoder,
     pub zrle_encoder: ZrleEncoder,
+    pub openh264_encoder: Option<crate::encode::openh264::OpenH264Encoder>,
     pub bandwidth_estimator: BandwidthEstimator,
     /// Fences sent to the client that have not yet been echoed back.
     pub pending_fences: VecDeque<PingFence>,
@@ -376,6 +377,10 @@ impl VncClient {
             tight_encoder: TightEncoder::new(),
             zlib_encoder: ZlibEncoder::new(),
             zrle_encoder: ZrleEncoder::new(),
+            openh264_encoder: crate::encode::openh264::OpenH264Encoder::new(
+                width as u32,
+                height as u32,
+            ),
             bandwidth_estimator: BandwidthEstimator::new(50_000),
             pending_fences: VecDeque::new(),
             fence_cap_warned: false,
@@ -583,6 +588,11 @@ impl VncClient {
 
     /// Send an RRE-encoded rectangle.
     pub fn send_rre_rect(&mut self, rect: &FbRect) -> io::Result<()> {
+        self.send_rect(rect)
+    }
+
+    /// Send an OpenH264-encoded rectangle.
+    pub fn send_openh264_rect(&mut self, rect: &FbRect) -> io::Result<()> {
         self.send_rect(rect)
     }
 

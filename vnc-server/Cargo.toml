@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["openh264"]
+openh264 = ["dep:openh264"]
+
 [dependencies]
 vnc-protocol = { path = "../vnc-protocol", features = ["jpeg-encode"] }
 log = "0.4"
@@ -23,6 +27,9 @@ nix = { version = "0.30", features = ["signal", "socket", "fs", "mman"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2.0"
 rcgen = "0.13"
+openh264 = { version = "0.9", optional = true }
 
 wayland-client = { version = "0.31", features = ["dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }

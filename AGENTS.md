@@ -82,6 +82,7 @@ openclaw/
 │       ├── apple.rs             # Apple high-performance protocol constants
 │       ├── apple_srp.rs         # Apple HP SRP auth
 │       ├── apple_record_layer.rs # Apple HP encrypted record layer
+│       ├── apple_media.rs       # Apple HP adaptive media path (0x1c) offer builder and parsers
 │       ├── stats.rs             # ConnectionStats transfer/encoding statistics
 │       ├── decoder/
 │       │   ├── mod.rs           # VideoDecoder trait + DefaultDecoder alias

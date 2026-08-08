@@ -355,8 +355,12 @@ impl<S: Read + Write> Write for AppleRecordLayer<S> {
 /// Apple high-performance encoding list.
 ///
 /// This is the full list advertised by the native client during the HP handshake.
-/// It is sent once in plaintext before the rekey and once encrypted after
-/// (via [`vnc_protocol::framing::build_set_encodings`]).
+/// It already includes the media-path encodings (`0x3ea` = 1002, `0x3f2` = 1010,
+/// `0x3f3` = 1011) because the same numeric values are used for both still-image
+/// codec announcements and media-stream reconfiguration rectangles.
+///
+/// It is sent once in plaintext before the rekey and once encrypted after (via
+/// [`vnc_protocol::framing::build_set_encodings`]).
 pub const APPLE_HP_ENCODINGS: &[i32] = &[
     1010, 1011, 1002, 6, 16, 1104, 1100, -223, 1101, 1105, 1107, 1109, 1110,
 ];

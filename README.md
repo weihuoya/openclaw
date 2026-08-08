@@ -83,15 +83,17 @@ Wayland-native VNC server built on `wlr-screencopy-unstable-v1` and `wlr-virtual
 ### Features
 
 - [x] TCP listener and RFB 3.8 handshake (None + VNC password auth)
-- [x] Raw, Hextile, Tight, and ZRLE frame encoders
-- [x] Wayland screen capture with tile-based damage tracking
-- [x] Virtual pointer and uinput virtual keyboard input
+- [x] Raw, Hextile, Tight, ZRLE, Zlib, RRE, TRLE, CopyRect, and OpenH264 frame encoders
+- [x] Wayland screen capture with tile-based damage tracking and CopyRect
+- [x] Virtual pointer via `wlr-virtual-pointer`
+- [x] Virtual keyboard via uinput (fallback) or `zwp-virtual-keyboard-v1` (preferred, no root required)
 - [x] Continuous updates, desktop resize, and extended desktop size
+- [x] Cursor pseudo-encoding (-239) and cursor position updates
+- [x] Desktop name pseudo-encoding
 - [x] Bidirectional clipboard via `wlr-data-control`
-- [x] JSON Unix-socket control interface (`status`, `set-password`, `set-rate`, `set-output`, `disconnect-client`, ...)
-- [ ] CopyRect, RRE, TRLE encoders
-- [ ] Cursor pseudo-encoding
-- [ ] TLS / VeNCrypt / RSA-AES security
+- [x] JSON Unix-socket control interface (`status`, `set-password`, `set-rate`, `set-output`, `disconnect-client`, `get-stats`, `set-latency`, ...)
+- [x] TLS / VeNCrypt / RSA-AES security
+- [x] Fence pseudo-encoding for bandwidth estimation
 
 ### Build
 

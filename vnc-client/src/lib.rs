@@ -67,6 +67,7 @@ use crate::tls::TlsStream;
 
 pub mod apple;
 pub mod apple_dh;
+pub mod apple_media;
 pub mod apple_record_layer;
 pub mod apple_srp;
 pub mod auth;
@@ -89,10 +90,11 @@ pub mod ws;
 pub mod zlib;
 pub mod zrle;
 
+use apple_media::{MediaStreamAnswer, MediaStreamInit, MediaStreamKeys};
 use auth::AuthHandler;
 use cursor::CursorShape;
 use decoder::DefaultDecoder;
-use encodings::Encoding;
+use encodings::{from_i32, Encoding};
 use flate2::read::ZlibDecoder;
 use framebuffer::Framebuffer;
 use vnc_protocol::rect::check_dimensions;
@@ -344,6 +346,12 @@ pub struct VncClient {
     /// Whether to request a virtual display (curtain mode) in Apple HP mode.
     /// When false, the server's physical display is mirrored.
     apple_virtual_display: bool,
+    /// Whether to enable the Apple HP adaptive media stream path and advertise
+    /// the media-init encodings (`0x3ea`, `0x3f2`, `0x3f3`).
+    apple_media_stream_h264: bool,
+    /// Apple HP encoding list used during the plaintext and encrypted SetEncodings
+    /// handshake. Varies depending on whether the media stream path is enabled.
+    apple_hp_encodings: Vec<i32>,
     /// Apple cursor cache keyed by `cache_id`. STOREd cursors are kept here;
     /// SELECT rectangles reference a cached id and emit a `CursorShape` event.
     apple_cursor_cache: HashMap<u32, AppleCursor>,
@@ -425,6 +433,17 @@ pub enum VncEvent {
     /// Remote clipboard changed; the caller may call `request_clipboard_fetch` to
     /// pull the updated pasteboard (Apple HP).
     ClipboardChanged,
+    /// Apple HP media stream answer received after sending a `0x1c` offer.
+    ///
+    /// Carries the negotiated video canvas dimensions and tile/SSRC count. A
+    /// degenerate answer with zero dimensions may be emitted if the encoder is not
+    /// ready yet; callers should re-send the offer and retry.
+    MediaStreamAnswer(MediaStreamAnswer),
+    /// Apple HP media stream init announcement (`0x3f2` stage 1 / stage 2).
+    ///
+    /// Provides the UDP base port hint and stream count; the actual RTP/SRTP
+    /// media channel setup is left to the application.
+    MediaStreamInit(MediaStreamInit),
     /// Audio data received (QEMU extension).
     Audio {
         sample_rate: u32,
@@ -495,6 +514,8 @@ impl VncClient {
             apple_display_dynamic: false,
             apple_hidpi_scale: 2.0,
             apple_virtual_display: true,
+            apple_media_stream_h264: false,
+            apple_hp_encodings: apple_record_layer::APPLE_HP_ENCODINGS.to_vec(),
             apple_cursor_cache: HashMap::new(),
         }
     }
@@ -976,7 +997,7 @@ impl VncClient {
                 }
                 log::debug!("Apple HP: sending initial SetEncodings");
                 stream.write_all(&protocol::framing::build_set_encodings(
-                    apple_record_layer::APPLE_HP_ENCODINGS,
+                    &self.apple_hp_encodings,
                 ))?;
             }
 
@@ -1368,6 +1389,53 @@ impl VncClient {
         Ok(())
     }
 
+    /// Send an Apple HP `MediaStreamOptions` (0x1c) offer to negotiate the adaptive
+    /// media path.
+    ///
+    /// Only available when Apple high-performance mode is active. The offer
+    /// requests a single H.264 video stream (one tile per frame, decodable by any
+    /// standard H.264 decoder) and an audio stream. The audio stream can be
+    /// suppressed with `audio_enabled = false`.
+    ///
+    /// Returns the generated SRTP master keys; the caller should keep them for the
+    /// application-level media channel. The server reply is read with
+    /// [`Self::read_hp_media_stream_answer`] or emitted as a
+    /// [`VncEvent::MediaStreamAnswer`] through the regular message loop.
+    pub fn send_hp_media_stream_options(
+        &mut self,
+        audio_enabled: bool,
+    ) -> Result<MediaStreamKeys, VncError> {
+        if !self.high_performance {
+            return Err(VncError::Protocol(
+                "Apple HP media stream requires high-performance mode".to_string(),
+            ));
+        }
+        let keys = MediaStreamKeys::random();
+        let msg = apple_media::build_media_stream_options(&keys, audio_enabled, true);
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&msg)?;
+        Ok(keys)
+    }
+
+    /// Read a server-side `0x1c` media-stream answer from the record layer.
+    ///
+    /// This is a synchronous helper that reads a single record and attempts to parse
+    /// the binary plist answer. Returns a degenerate `(0, 0, 0)`-style answer if the
+    /// encoder has not yet populated the media blob; callers should retry the offer
+    /// in that case.
+    pub fn read_hp_media_stream_answer(&mut self) -> Result<MediaStreamAnswer, VncError> {
+        let mut buf = vec![0u8; 8192];
+        let n = self
+            .stream
+            .as_mut()
+            .ok_or(VncError::NotConnected)?
+            .read(&mut buf)?;
+        buf.truncate(n);
+        apple_media::parse_media_stream_answer(&buf).ok_or_else(|| {
+            VncError::Protocol("Failed to parse Apple HP media stream answer".to_string())
+        })
+    }
+
     /// Enable continuous updates (server pushes frames without client requests).
     pub fn enable_continuous_updates(
         &mut self,
@@ -1706,17 +1774,24 @@ impl VncClient {
                     let payload_len = u16::from_be_bytes(len_buf) as usize;
                     let mut payload = vec![0u8; payload_len];
                     stream.read_exact(&mut payload)?;
-                    log::debug!(
-                        "Apple media stream announcement (encoding {:#x}) ignored",
-                        protocol::apple::ENC_MEDIA_STREAM
-                    );
+                    if let Some(init) = apple_media::parse_media_stream_init(&payload) {
+                        log::debug!(
+                            "Apple media stream init stage={} port={}",
+                            init.stage,
+                            init.base_udp_port
+                        );
+                        events.push(VncEvent::MediaStreamInit(init));
+                    } else {
+                        log::debug!(
+                            "Apple media stream announcement (encoding {:#x}) malformed",
+                            protocol::apple::ENC_MEDIA_STREAM
+                        );
+                    }
                     continue;
                 }
                 Encoding::AppleHp(enc)
                     if enc == protocol::apple::ENC_LOW_QUALITY
-                        || enc == protocol::apple::ENC_MEDIUM_QUALITY
-                        || enc == protocol::apple::ENC_HIGH_QUALITY
-                        || enc == protocol::apple::ENC_MULTI_VARIANT_SCALED =>
+                        || enc == protocol::apple::ENC_MEDIUM_QUALITY =>
                 {
                     // Apple still-image codecs (u32 nbytes + payload).
                     let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
@@ -1736,6 +1811,35 @@ impl VncClient {
                     let mut payload = vec![0u8; len];
                     stream.read_exact(&mut payload)?;
                     log::debug!("Apple still-image codec (encoding {:#x}) ignored", enc);
+                    continue;
+                }
+                Encoding::AppleHp(enc)
+                    if enc == protocol::apple::ENC_HIGH_QUALITY
+                        || enc == protocol::apple::ENC_MULTI_VARIANT_SCALED =>
+                {
+                    // In the adaptive media path these encodings are media-stream
+                    // reconfig rectangles sharing the same u16-prefixed wire shape
+                    // as 0x3f2. We parse the prefix and emit a media-init event.
+                    // If the server is using them as still-image codecs instead, this
+                    // branch will misread; that is a known limitation of preliminary
+                    // H.264 media support.
+                    let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+                    let mut len_buf = [0u8; 2];
+                    stream.read_exact(&mut len_buf)?;
+                    let payload_len = u16::from_be_bytes(len_buf) as usize;
+                    let mut payload = vec![0u8; payload_len];
+                    stream.read_exact(&mut payload)?;
+                    if let Some(init) = apple_media::parse_media_stream_init(&payload) {
+                        log::debug!(
+                            "Apple media reconfig {:#x} stage={} port={}",
+                            enc,
+                            init.stage,
+                            init.base_udp_port
+                        );
+                        events.push(VncEvent::MediaStreamInit(init));
+                    } else {
+                        log::debug!("Apple media reconfig (encoding {:#x}) malformed", enc);
+                    }
                     continue;
                 }
                 _ => {
@@ -2883,6 +2987,7 @@ pub struct VncClientBuilder {
     apple_display_dynamic: bool,
     apple_hidpi_scale: f32,
     apple_virtual_display: bool,
+    apple_media_stream_h264: bool,
 }
 
 impl VncClientBuilder {
@@ -2914,6 +3019,7 @@ impl VncClientBuilder {
             apple_display_dynamic: false,
             apple_hidpi_scale: 2.0,
             apple_virtual_display: true,
+            apple_media_stream_h264: false,
         }
     }
 
@@ -2921,35 +3027,27 @@ impl VncClientBuilder {
     ///
     /// When enabled, the Apple HP encodings are prepended to the current
     /// encoding list rather than replacing it, so user-supplied fallbacks are
-    /// preserved.
+    /// preserved. The exact HP encoding list (with or without the adaptive media
+    /// path encodings) is finalized in [`Self::build`].
     pub fn high_performance(mut self, enable: bool) -> Self {
         self.high_performance = enable;
-        if enable {
-            let hp_encodings = vec![
-                Encoding::AppleHp(1010),
-                Encoding::AppleHp(1011),
-                Encoding::AppleHp(1002),
-                Encoding::Zlib,
-                Encoding::Zrle,
-                Encoding::AppleHp(1104),
-                Encoding::AppleHp(1100),
-                Encoding::DesktopSize,
-                Encoding::AppleHp(1101),
-                Encoding::AppleHp(1105),
-                Encoding::AppleHp(1107),
-                Encoding::AppleHp(1109),
-                Encoding::AppleHp(1110),
-            ];
-            // Merge user's existing encodings after the HP ones, preserving
-            // order and avoiding duplicates.
-            let mut merged = hp_encodings;
-            for enc in self.encodings.drain(..) {
-                if !merged.contains(&enc) {
-                    merged.push(enc);
-                }
-            }
-            self.encodings = merged;
-        }
+        self
+    }
+
+    /// Enable the Apple HP adaptive media stream path and request H.264.
+    ///
+    /// The Apple HP encoding list already advertises the media-path values
+    /// (`0x3ea` = 1002, `0x3f2` = 1010, `0x3f3` = 1011), so this flag does not
+    /// change the advertised encodings. It enables the `0x1c` MediaStreamOptions
+    /// offer API (`send_hp_media_stream_options`) and the parser for media-init
+    /// rectangles (`VncEvent::MediaStreamInit`).
+    ///
+    /// The actual UDP/SRTP media channel is not implemented here; this is only
+    /// the negotiation plumbing.
+    ///
+    /// Has no effect unless [`Self::high_performance`] is also enabled.
+    pub fn apple_media_stream_h264(mut self, enable: bool) -> Self {
+        self.apple_media_stream_h264 = enable;
         self
     }
 
@@ -3024,7 +3122,6 @@ impl VncClientBuilder {
         if let Some(format) = self.pixel_format {
             client.pixel_format = format;
         }
-        client.encodings = self.encodings;
         client.sasl_username = self.sasl_username;
         client.sasl_password = self.sasl_password;
         client.high_performance = self.high_performance;
@@ -3033,10 +3130,37 @@ impl VncClientBuilder {
         client.apple_display_dynamic = self.apple_display_dynamic;
         client.apple_hidpi_scale = self.apple_hidpi_scale;
         client.apple_virtual_display = self.apple_virtual_display;
+        client.apple_media_stream_h264 = self.apple_media_stream_h264;
+
         if self.high_performance {
             // Apple HP uses the dedicated shared byte to request virtual-display setup.
             client.client_init_shared = protocol::apple::CLIENT_INIT_SHARED;
+
+            // The HP encoding list already advertises the media-path values
+            // (0x3ea = 1002, 0x3f2 = 1010, 0x3f3 = 1011). Deduplicate while mapping
+            // so the plaintext/encrypted SetEncodings messages do not list any value
+            // twice.
+            let mut merged: Vec<Encoding> = Vec::with_capacity(
+                apple_record_layer::APPLE_HP_ENCODINGS.len() + self.encodings.len(),
+            );
+            for &v in apple_record_layer::APPLE_HP_ENCODINGS {
+                let enc = from_i32(v);
+                if !merged.contains(&enc) {
+                    merged.push(enc);
+                }
+            }
+            for enc in self.encodings {
+                if !merged.contains(&enc) {
+                    merged.push(enc);
+                }
+            }
+            client.apple_hp_encodings = merged.iter().map(|e| e.as_i32()).collect();
+            client.encodings = merged;
+        } else {
+            client.encodings = self.encodings;
+            client.apple_hp_encodings = apple_record_layer::APPLE_HP_ENCODINGS.to_vec();
         }
+
         client
     }
 }
@@ -3078,6 +3202,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn high_performance_media_stream_h264_sets_flag() {
+        let client = VncClientBuilder::new()
+            .high_performance(true)
+            .apple_media_stream_h264(true)
+            .build();
+        assert!(client.high_performance);
+        assert!(client.apple_media_stream_h264);
+        // The HP encoding list already advertises the media-path values.
+        assert!(client.apple_hp_encodings.contains(&1002)); // 0x3ea
+        assert!(client.apple_hp_encodings.contains(&1010)); // 0x3f2
+        assert!(client.apple_hp_encodings.contains(&1011)); // 0x3f3
+                                                            // No duplicate values should be present.
+        let mut uniq = client.apple_hp_encodings.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), client.apple_hp_encodings.len());
+    }
+
+    #[test]
+    fn high_performance_without_media_stream_h264_clears_flag() {
+        let client = VncClientBuilder::new().high_performance(true).build();
+        assert!(!client.apple_media_stream_h264);
     }
 
     #[test]
