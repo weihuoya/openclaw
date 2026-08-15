@@ -5,7 +5,7 @@
 //!
 //! * `build_media_stream_options` — constructs the client→server `0x1c`
 //!   MediaStreamOptions offer carrying SRTP master keys and compressed audio +
-//!   video codec offers. Requesting H.264 only is supported.
+//!   a single HEVC video codec offer.
 //! * `parse_media_stream_answer` — extracts the negotiated canvas dimensions and
 //!   tile count from the server→client `0x1c` answer.
 //! * `parse_media_stream_init` — extracts UDP port hints from the `0x3f2`
@@ -21,10 +21,13 @@ use rand::RngCore;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::decoder::Codec;
+
 /// Length of a single SRTP master key blob: 32-byte cipher key + 14-byte salt.
 pub const SRTP_KEY_BLOB_LEN: usize = 46;
 
-/// SRTP master key blobs exchanged in the `0x1c` MediaStreamOptions message.
+/// SRTP master key blobs and negotiated SSRCs exchanged in the `0x1c`
+/// MediaStreamOptions message.
 #[derive(Debug, Clone)]
 pub struct MediaStreamKeys {
     /// Audio, viewer → server (used to authenticate outgoing RTCP/SRTCP).
@@ -35,10 +38,15 @@ pub struct MediaStreamKeys {
     pub video_key_v: [u8; SRTP_KEY_BLOB_LEN],
     /// Video, server → viewer (used to unprotect incoming video).
     pub video_key_s: [u8; SRTP_KEY_BLOB_LEN],
+    /// Audio stream SSRC negotiated in the offer (used for outgoing audio
+    /// RTP keepalives).
+    pub audio_ssrc: u32,
+    /// Video stream SSRC negotiated in the offer (used as the RTCP sender SSRC).
+    pub video_ssrc: u32,
 }
 
 impl MediaStreamKeys {
-    /// Generate fresh random SRTP master key blobs.
+    /// Generate fresh random SRTP master key blobs and SSRCs.
     pub fn random() -> Self {
         let mut rng = rand::thread_rng();
         let mut gen = || {
@@ -51,6 +59,8 @@ impl MediaStreamKeys {
             audio_key_s: gen(),
             video_key_v: gen(),
             video_key_s: gen(),
+            audio_ssrc: rng.next_u32(),
+            video_ssrc: rng.next_u32(),
         }
     }
 }
@@ -64,6 +74,8 @@ pub struct MediaStreamAnswer {
     pub canvas_height: u32,
     /// Number of tile/SSRC streams (typically 1 or 4).
     pub tile_count: u32,
+    /// Selected video codec for the adaptive stream.
+    pub codec: Codec,
 }
 
 /// Parsed `0x3f2` RFBMediaStreamMessage1 media-init announcement.
@@ -87,28 +99,22 @@ pub struct MediaStreamInit {
 /// present because the daemon treats an empty audio section as a degenerate
 /// offer.
 ///
-/// `h264_only` advertises only the bank that yields an H.264 4:2:0 stream from
-/// the server. Apple maps the bank labels inversely: the "HEVC" parameter bank
-/// (codec constant 123) produces H.264, while the "AVC" bank (codec constant
-/// 100) produces HEVC. When `h264_only` is false, both banks are advertised.
+/// The video offer always advertises both a "HEVC" bank (codec constant 123)
+/// and an "AVC" bank (codec constant 100); Apple selects the AVC bank to send
+/// an HEVC 4:4:4 stream.
 ///
 /// The returned bytes are the full `0x1c` message body (starting with message
 /// type `0x1c`); the caller is responsible for sending it through the Apple HP
 /// record layer.
-pub fn build_media_stream_options(
-    keys: &MediaStreamKeys,
-    audio_enabled: bool,
-    h264_only: bool,
-) -> Vec<u8> {
-    let session_id = rand::random::<u32>();
+pub fn build_media_stream_options(keys: &MediaStreamKeys, audio_enabled: bool) -> Vec<u8> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let call_id = uuid_string();
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let call_id = random_uuid_string();
 
-    let video_offer = build_video_offer(session_id, timestamp, h264_only);
-    let audio_offer = build_audio_offer(session_id, timestamp, audio_enabled);
+    let video_offer = build_video_offer(keys.video_ssrc, timestamp);
+    let audio_offer = build_audio_offer(keys.audio_ssrc, timestamp, audio_enabled);
 
     let audio_size = audio_offer.len() as u16;
     let video_size = video_offer.len() as u16;
@@ -118,11 +124,9 @@ pub fn build_media_stream_options(
     let message_size = (audio_size as usize + video_size as usize + 0xd8) as u16;
 
     // Configuration flags. Bit 0 = 60fps stream 1, bit 1 = 60fps stream 2,
-    // bit 2 = do not bake cursor into encoded frames. We set bit 0 and bit 2
-    // for a standard console-user H.264 path (value 5). For a dual-stream
-    // advertisement we would also set bit 1 (value 7); with one video stream
-    // bit 1 is left clear.
-    let config_flags: u32 = 5;
+    // bit 2 = do not bake cursor into encoded frames. Match the reference
+    // client's default console-user offer: bits 0, 1, and 2 are set (value 7).
+    let config_flags: u32 = 7;
 
     let mut msg = Vec::with_capacity(4 + message_size as usize);
     msg.push(0x1c);
@@ -168,12 +172,13 @@ pub fn parse_media_stream_answer(answer: &[u8]) -> Option<MediaStreamAnswer> {
                     plist.get("avcMediaStreamNegotiatorMediaBlob")
                 {
                     let decompressed = zlib_decompress(blob)?;
-                    if let Some((cw, ch, ct)) = extract_video_answer_dims(&decompressed) {
+                    if let Some((cw, ch, ct, codec)) = extract_video_answer_dims(&decompressed) {
                         if cw != 0 && ch != 0 {
                             return Some(MediaStreamAnswer {
                                 canvas_width: cw,
                                 canvas_height: ch,
                                 tile_count: ct,
+                                codec,
                             });
                         }
                     }
@@ -188,39 +193,77 @@ pub fn parse_media_stream_answer(answer: &[u8]) -> Option<MediaStreamAnswer> {
 
 /// Parse a `0x3f2` media-init announcement rectangle payload.
 ///
-/// The payload begins with a big-endian `u16` length prefix, followed by the
-/// stage information. The reference client reports:
+/// The RFB rectangle body has a `u16` length prefix, followed by a fixed
+/// 14-byte header. The reference dissector (`mode_adaptive.py`) reads the
+/// fields at these offsets relative to the start of the length-prefixed
+/// payload (i.e. immediately after the `u16` length):
 ///
-/// * stage 1 (`version=1, type=1`): base UDP port hint in `field10`.
-/// * stage 2 (`version=2, type=2`): stream confirmation.
+/// * bytes 0..2  — version (`1` for stage 1, `2` for stage 2; some macOS
+///   builds emit `0` for the first announcement)
+/// * bytes 2..4  — type (`1` for stage 1, `2` for stage 2; often `0` alongside
+///   version `0`)
+/// * bytes 4..6  — field6 (port hint in the version/type=0 variant)
+/// * bytes 6..8  — field8 (stream count in the version/type=0 variant)
+/// * bytes 8..10 — field10 (port hint in the version/type=1 stage-1 variant)
+/// * bytes 10..14 — field12 (reserved u32)
 pub fn parse_media_stream_init(payload: &[u8]) -> Option<MediaStreamInit> {
     if payload.len() < 2 {
+        log::debug!(
+            "parse_media_stream_init: payload too short ({} bytes)",
+            payload.len()
+        );
         return None;
     }
     let len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    if payload.len() < 2 + len || len < 16 {
+    if payload.len() < 2 + len {
+        log::debug!(
+            "parse_media_stream_init: declared len {} exceeds {} bytes",
+            len,
+            payload.len() - 2
+        );
+        return None;
+    }
+    if len < 14 {
+        log::debug!("parse_media_stream_init: body too short (len={})", len);
         return None;
     }
     let body = &payload[2..2 + len];
 
-    let version = u16::from_be_bytes([body[2], body[3]]);
-    let stage_type = u16::from_be_bytes([body[4], body[5]]);
-    let field6 = u16::from_be_bytes([body[6], body[7]]);
-    let field8 = u16::from_be_bytes([body[8], body[9]]);
-    let field10 = u16::from_be_bytes([body[10], body[11]]);
-    let _field12 = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+    let version = u16::from_be_bytes([body[0], body[1]]);
+    let stage_type = u16::from_be_bytes([body[2], body[3]]);
+    let field6 = u16::from_be_bytes([body[4], body[5]]);
+    let field8 = u16::from_be_bytes([body[6], body[7]]);
+    let field10 = u16::from_be_bytes([body[8], body[9]]);
+    let field12 = u32::from_be_bytes([body[10], body[11], body[12], body[13]]);
 
-    let stage = match (version, stage_type) {
-        (1, 1) => 1,
-        (2, 2) => 2,
-        _ => 0,
+    let (stage, base_udp_port, stream_count, next_stream_port) = match (version, stage_type) {
+        (1, 1) => (1, field10, field8, field6),
+        (2, 2) => (2, 0, field8, 0),
+        (0, 0) => {
+            // Recent macOS builds emit a (0,0) media-init announcement
+            // before the stage-1/2 handshake. In this variant field6 carries
+            // the UDP port and field10 the stream count.
+            (1, field6, field10, field8)
+        }
+        _ => (0, 0, 0, 0),
     };
+
+    log::trace!(
+        "parse_media_stream_init: version={} type={} field6={} field8={} field10={} field12={} stage={}",
+        version,
+        stage_type,
+        field6,
+        field8,
+        field10,
+        field12,
+        stage
+    );
 
     Some(MediaStreamInit {
         stage,
-        base_udp_port: field10,
-        stream_count: field8,
-        next_stream_port: field6,
+        base_udp_port,
+        stream_count,
+        next_stream_port,
     })
 }
 
@@ -307,7 +350,8 @@ mod bplist {
             encode_ascii_string("avcMediaStreamNegotiatorMode"),
             encode_ascii_string("avcMediaStreamNegotiatorMediaBlob"),
             encode_ascii_string("avcMediaStreamOptionCallID"),
-            encode_dict(4, &[4, 0, 5, 1, 6, 2, 7, 3]),
+            // Binary plist dict layout: all key refs first, then all value refs.
+            encode_dict(4, &[4, 5, 6, 7, 0, 1, 2, 3]),
         ];
 
         let mut table = Vec::new();
@@ -511,12 +555,13 @@ mod bplist {
         } else {
             read_count(data, &mut pos)?
         };
+        // Binary-plist dict layout: all key refs come first, then all value refs.
         if pos + 2 * len * ref_size > data.len() {
             return None;
         }
         for i in 0..len {
-            let key_ref = read_ref(data, pos + 2 * i * ref_size, ref_size)? as usize;
-            let val_ref = read_ref(data, pos + (2 * i + 1) * ref_size, ref_size)? as usize;
+            let key_ref = read_ref(data, pos + i * ref_size, ref_size)? as usize;
+            let val_ref = read_ref(data, pos + (len + i) * ref_size, ref_size)? as usize;
             let key = match get_value(data, key_ref, &offsets, &mut values) {
                 Some(Value::String(s)) => s,
                 _ => continue,
@@ -596,46 +641,35 @@ mod bplist {
 // Offer construction
 // ---------------------------------------------------------------------------
 
-fn build_video_offer(session_id: u32, timestamp: u64, h264_only: bool) -> Vec<u8> {
-    let ltrp = !h264_only; // LTRP must be off for H.264.
-    let tiles = 1u64; // One self-contained picture per frame: decodable by any standard H.264 decoder.
+fn build_video_offer(session_id: u32, timestamp: u64) -> Vec<u8> {
+    let tiles = 4u64; // Match Apple's native offer.
 
     let res_entry = build_resolution_entry(1);
     let res_entry_alt = build_resolution_entry(2);
 
-    let hevc_bank = build_bank(
-        123, // yields H.264 from the server
-        &res_entry,
-        &res_entry_alt,
-        if ltrp {
-            HEVC_PARAMS_LTR
-        } else {
-            HEVC_PARAMS_NO_LTR
-        },
-        1,
-    );
-    let avc_bank = build_bank(
-        100, // yields HEVC from the server
-        &res_entry,
-        &res_entry_alt,
-        AVC_PARAMS,
-        14,
-    );
+    // Apple maps the bank labels inversely from the codec they request:
+    //   * field1=123 with HEVC parameter string → server sends H.264 4:2:0
+    //   * field1=100 with AVC parameter string  → server sends HEVC 4:4:4
+    // The reference client advertises both banks (HEVC first); macOS then picks
+    // its preferred HEVC 4:4:4 path.
+    //
+    // Note: the HEVC bank carries four resolution entries, the AVC bank only two.
+    // Reversing this or using four entries for both produces a slightly larger
+    // offer that the daemon rejects.
+    let hevc_bank = build_bank(123, &res_entry, &res_entry_alt, HEVC_PARAMS_LTR, 1);
+    let avc_bank = build_bank_two_entries(100, &res_entry, &res_entry_alt, AVC_PARAMS, 14);
 
-    let codec_banks = if h264_only {
-        protobuf::field_bytes(3, &hevc_bank)
-    } else {
-        let mut v = protobuf::field_bytes(3, &hevc_bank);
-        v.extend(protobuf::field_bytes(3, &avc_bank));
-        v
-    };
+    let mut codec_banks = protobuf::field_bytes(3, &hevc_bank);
+    codec_banks.extend(protobuf::field_bytes(3, &avc_bank));
 
+    // LTRP is enabled (field 2 and 7) because the preferred HEVC path supports
+    // long-term reference pictures.
     let desc = [
         protobuf::field_varint(1, session_id as u64),
-        protobuf::field_varint(2, if ltrp { 1 } else { 0 }),
+        protobuf::field_varint(2, 1),
         codec_banks,
         protobuf::field_varint(6, tiles),
-        protobuf::field_varint(7, if ltrp { 1 } else { 0 }),
+        protobuf::field_varint(7, 1),
         protobuf::field_varint(8, 63),
         protobuf::field_varint(9, 1),
         protobuf::field_varint(12, 1),
@@ -707,6 +741,22 @@ fn build_bank(
     bank
 }
 
+fn build_bank_two_entries(
+    codec_constant: u64,
+    res_entry: &[u8],
+    res_entry_alt: &[u8],
+    params: &[u8],
+    field4: u64,
+) -> Vec<u8> {
+    let mut bank = Vec::new();
+    bank.extend(protobuf::field_varint(1, codec_constant));
+    bank.extend(protobuf::field_bytes(2, res_entry));
+    bank.extend(protobuf::field_bytes(2, res_entry_alt));
+    bank.extend(protobuf::field_bytes(3, params));
+    bank.extend(protobuf::field_varint(4, field4));
+    bank
+}
+
 fn build_audio_f9_tiers() -> Vec<u8> {
     const TIERS: &[(u64, u64, Option<u64>)] = &[
         (0, 40_000_000, Some(12288)),
@@ -738,10 +788,36 @@ fn build_remote_endpoint_info() -> Vec<u8> {
     let mut info = Vec::new();
     info.extend_from_slice(b"\x08\x00"); // field 1 = 0
     info.extend_from_slice(b"\x10\x01"); // field 2 = 1
-    info.extend(protobuf_str_field(3, "Generic"));
+                                         // Match the reference client's RemoteEndpointInfo shape: capitalised OS name
+                                         // and a real-looking build string. The daemon treats this as informational,
+                                         // but lowercase/empty strings differ on the wire.
+    let hw_model = format!(
+        "{}-{}",
+        capitalise_first(std::env::consts::OS),
+        std::env::consts::ARCH
+    );
+    info.extend(protobuf_str_field(3, &hw_model));
     info.extend(protobuf_str_field(4, "1.0.0"));
-    info.extend(protobuf_str_field(5, "0"));
+    // Use the running kernel/build string instead of a hard-coded "0" so the
+    // offer resembles a real viewer endpoint.
+    let os_build = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "0".to_string());
+    info.extend(protobuf_str_field(5, &os_build));
     info
+}
+
+fn capitalise_first(s: &str) -> String {
+    if s.is_empty() {
+        return s.to_string();
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap().to_uppercase().collect::<String>();
+    first + chars.as_str()
 }
 
 fn protobuf_str_field(field: u32, s: &str) -> Vec<u8> {
@@ -758,7 +834,7 @@ fn build_plist(mode: u64, media_blob: &[u8]) -> Vec<u8> {
         &build_remote_endpoint_info(),
         mode,
         media_blob,
-        &uuid_string(),
+        &random_uuid_string(),
     )
 }
 
@@ -766,11 +842,12 @@ fn build_plist(mode: u64, media_blob: &[u8]) -> Vec<u8> {
 // Parsers
 // ---------------------------------------------------------------------------
 
-fn extract_video_answer_dims(blob: &[u8]) -> Option<(u32, u32, u32)> {
+fn extract_video_answer_dims(blob: &[u8]) -> Option<(u32, u32, u32, Codec)> {
     let mut pos = 0;
     let mut canvas_w = 0u32;
     let mut canvas_h = 0u32;
     let mut tile_count = 0u32;
+    let mut codec = None;
     while pos < blob.len() {
         let (tag, p) = protobuf::read_varint(blob, pos)?;
         pos = p;
@@ -805,6 +882,12 @@ fn extract_video_answer_dims(blob: &[u8]) -> Option<(u32, u32, u32)> {
                             }
                             2 => {
                                 let (l, p2) = protobuf::read_varint(sub, sp)?;
+                                if sf == 3 && l as usize <= sub.len().saturating_sub(p2) {
+                                    // The selected codec bank is a sub-message
+                                    // whose field 1 contains the codec constant.
+                                    // 123 -> H.264, 100 -> HEVC.
+                                    codec = extract_selected_codec(&sub[p2..p2 + l as usize]);
+                                }
                                 sp = p2 + l as usize;
                             }
                             1 => sp += 8,
@@ -820,7 +903,34 @@ fn extract_video_answer_dims(blob: &[u8]) -> Option<(u32, u32, u32)> {
             _ => break,
         }
     }
-    Some((canvas_w, canvas_h, tile_count))
+    Some((canvas_w, canvas_h, tile_count, codec.unwrap_or(Codec::H264)))
+}
+
+fn extract_selected_codec(bank: &[u8]) -> Option<Codec> {
+    let mut pos = 0;
+    while pos < bank.len() {
+        let (tag, p) = protobuf::read_varint(bank, pos)?;
+        pos = p;
+        let field = tag >> 3;
+        let wt = tag & 7;
+        if wt == 0 {
+            let (v, p) = protobuf::read_varint(bank, pos)?;
+            pos = p;
+            if field == 1 {
+                return match v {
+                    123 => Some(Codec::H264),
+                    100 => Some(Codec::Hevc),
+                    _ => None,
+                };
+            }
+        } else if wt == 2 {
+            let (len, p) = protobuf::read_varint(bank, pos)?;
+            pos = p + len as usize;
+        } else {
+            break;
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +943,7 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap_or_default()
 }
 
-fn zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
     use flate2::read::ZlibDecoder;
     use std::io::Read;
     let mut decoder = ZlibDecoder::new(data);
@@ -863,10 +973,14 @@ fn uuid_bytes(uuid: &str) -> [u8; 16] {
     out
 }
 
-fn uuid_string() -> String {
-    let bytes: [u8; 16] = rand::random();
+fn random_uuid_string() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    // UUIDv4-ish layout: version=4, variant=10.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(
-        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         bytes[0], bytes[1], bytes[2], bytes[3],
         bytes[4], bytes[5],
         bytes[6], bytes[7],
@@ -884,11 +998,9 @@ fn hex_to_nibble(b: u8) -> u8 {
     }
 }
 
+const AVC_PARAMS: &[u8] = b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;XR:16/9,5/8;";
 const HEVC_PARAMS_LTR: &[u8] =
     b"FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;";
-const HEVC_PARAMS_NO_LTR: &[u8] =
-    b"FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;";
-const AVC_PARAMS: &[u8] = b"FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;XR:16/9,5/8;";
 
 #[cfg(test)]
 mod tests {
@@ -897,17 +1009,152 @@ mod tests {
     #[test]
     fn offer_has_expected_layout() {
         let keys = MediaStreamKeys::random();
-        let msg = build_media_stream_options(&keys, true, true);
+        let msg = build_media_stream_options(&keys, true);
         assert_eq!(msg[0], 0x1c);
         assert_eq!(msg[1], 0x00);
         let message_size = u16::from_be_bytes([msg[2], msg[3]]) as usize;
         assert_eq!(msg.len(), 4 + message_size);
         assert_eq!(u16::from_be_bytes([msg[4], msg[5]]), 3); // version
-        assert_eq!(u32::from_be_bytes([msg[6], msg[7], msg[8], msg[9]]), 5); // flags
+        assert_eq!(u32::from_be_bytes([msg[6], msg[7], msg[8], msg[9]]), 7); // flags
         let audio_size = u16::from_be_bytes([msg[10], msg[11]]) as usize;
         let video_size = u16::from_be_bytes([msg[12], msg[13]]) as usize;
         assert!(audio_size > 0);
         assert!(video_size > 0);
+    }
+
+    #[test]
+    fn offer_contains_hevc_bank_only() {
+        let keys = MediaStreamKeys {
+            audio_key_v: [0u8; SRTP_KEY_BLOB_LEN],
+            audio_key_s: [0u8; SRTP_KEY_BLOB_LEN],
+            video_key_v: [0u8; SRTP_KEY_BLOB_LEN],
+            video_key_s: [0u8; SRTP_KEY_BLOB_LEN],
+            audio_ssrc: 1,
+            video_ssrc: 2,
+        };
+        let offer = build_media_stream_options(&keys, false);
+        let codecs = extract_offer_codec_constants(&offer);
+        assert_eq!(codecs, vec![123, 100]);
+    }
+
+    fn extract_offer_codec_constants(offer: &[u8]) -> Vec<u64> {
+        // Header layout matches build_media_stream_options.
+        let audio_size = u16::from_be_bytes([offer[10], offer[11]]) as usize;
+        let video_size = u16::from_be_bytes([offer[12], offer[13]]) as usize;
+        // Header is 14 bytes, followed by 6 reserved bytes, 16-byte UUID, both
+        // audio keys, the audio offer, and then both video keys before the
+        // video offer.
+        let video_start = 14 + 6 + 16 + 92 + audio_size + 92;
+        let video_offer = &offer[video_start..video_start + video_size];
+
+        let plist = super::bplist::parse_dict(video_offer).expect("parse offer plist");
+        let media_blob = match plist.get("avcMediaStreamNegotiatorMediaBlob") {
+            Some(super::bplist::Value::Data(d)) => d,
+            _ => return Vec::new(),
+        };
+        let decompressed = super::zlib_decompress(media_blob).expect("decompress media blob");
+
+        // Top-level media blob: field 5 carries the video description.
+        let desc = extract_field_2_bytes(&decompressed, 5).expect("video desc field");
+
+        // Description: field 3 carries the codec banks (repeated).
+        extract_repeated_field_2_bytes(desc, 3)
+            .iter()
+            .filter_map(|bank| extract_bank_codec_constant(bank))
+            .collect()
+    }
+
+    fn extract_field_2_bytes(data: &[u8], target: u64) -> Option<&[u8]> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let (tag, p) = super::protobuf::read_varint(data, pos)?;
+            pos = p;
+            let field = tag >> 3;
+            let wt = tag & 7;
+            if field == target && wt == 2 {
+                let (len, p) = super::protobuf::read_varint(data, pos)?;
+                pos = p;
+                return Some(&data[pos..pos + len as usize]);
+            } else if wt == 2 {
+                let (len, p) = super::protobuf::read_varint(data, pos)?;
+                pos = p + len as usize;
+            } else if wt == 0 {
+                let (_, p) = super::protobuf::read_varint(data, pos)?;
+                pos = p;
+            } else if wt == 1 {
+                pos += 8;
+            } else if wt == 5 {
+                pos += 4;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    fn extract_repeated_field_2_bytes(data: &[u8], target: u64) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            let Some((tag, p)) = super::protobuf::read_varint(data, pos) else {
+                break;
+            };
+            pos = p;
+            let field = tag >> 3;
+            let wt = tag & 7;
+            if field == target && wt == 2 {
+                let Some((len, p)) = super::protobuf::read_varint(data, pos) else {
+                    break;
+                };
+                pos = p;
+                out.push(&data[pos..pos + len as usize]);
+                pos += len as usize;
+            } else if wt == 2 {
+                let Some((len, p)) = super::protobuf::read_varint(data, pos) else {
+                    break;
+                };
+                pos = p + len as usize;
+            } else if wt == 0 {
+                let Some((_, p)) = super::protobuf::read_varint(data, pos) else {
+                    break;
+                };
+                pos = p;
+            } else if wt == 1 {
+                pos += 8;
+            } else if wt == 5 {
+                pos += 4;
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    fn extract_bank_codec_constant(bank: &[u8]) -> Option<u64> {
+        let mut pos = 0;
+        while pos < bank.len() {
+            let (tag, p) = super::protobuf::read_varint(bank, pos)?;
+            pos = p;
+            let field = tag >> 3;
+            let wt = tag & 7;
+            if field == 1 && wt == 0 {
+                let (v, _) = super::protobuf::read_varint(bank, pos)?;
+                return Some(v);
+            } else if wt == 2 {
+                let (len, p) = super::protobuf::read_varint(bank, pos)?;
+                pos = p + len as usize;
+            } else if wt == 0 {
+                let (_, p) = super::protobuf::read_varint(bank, pos)?;
+                pos = p;
+            } else if wt == 1 {
+                pos += 8;
+            } else if wt == 5 {
+                pos += 4;
+            } else {
+                break;
+            }
+        }
+        None
     }
 
     #[test]
@@ -936,13 +1183,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_media_stream_answer_extracts_canvas() {
+    fn parse_media_stream_answer_extracts_canvas_and_codec() {
         // Build a minimal video MediaBlob answer: a top-level field 5 sub-message
-        // carries canvas width/height and tile count.
+        // carries canvas width/height/tile count, plus a field-3 codec bank
+        // selecting HEVC (codec constant 100).
+        let mut bank = Vec::new();
+        bank.extend(super::protobuf::field_varint(1, 100)); // HEVC selected
+        bank.extend(super::protobuf::field_bytes(2, b"res"));
+        bank.extend(super::protobuf::field_bytes(3, b"params"));
+
         let mut inner = Vec::new();
         inner.extend(super::protobuf::field_varint(4, 1920));
         inner.extend(super::protobuf::field_varint(5, 1080));
         inner.extend(super::protobuf::field_varint(6, 1));
+        inner.extend(super::protobuf::field_bytes(3, &bank));
         let desc = super::protobuf::field_bytes(5, &inner);
         let media_blob = super::zlib_compress(&desc);
         let plist =
@@ -951,6 +1205,7 @@ mod tests {
         assert_eq!(answer.canvas_width, 1920);
         assert_eq!(answer.canvas_height, 1080);
         assert_eq!(answer.tile_count, 1);
+        assert_eq!(answer.codec, super::super::decoder::Codec::Hevc);
     }
 
     #[test]
@@ -965,19 +1220,57 @@ mod tests {
     }
     #[test]
     fn parse_media_stream_init_stage1() {
+        // Stage-1 announcement: u16 length prefix followed immediately by the
+        // 14-byte fixed header (no leading padding).
         let payload = [
-            0x00, 0x10, // payload_len = 16
-            0x00, 0x00, 0x00, 0x01, // version
-            0x00, 0x01, // type
-            0x00, 0x02, // field6
-            0x00, 0x03, // field8
-            0x12, 0x34, // field10
-            0x00, 0x00, 0x00, 0x00, // field12
+            0x00, 0x0e, // payload_len = 14
+            0x00, 0x01, // version = 1
+            0x00, 0x01, // type = 1 (stage 1)
+            0x00, 0x02, // field6 = next stream port
+            0x00, 0x03, // field8 = stream count
+            0x12, 0x34, // field10 = base UDP port
+            0x00, 0x00, 0x00, 0x00, // field12 = reserved
         ];
         let init = parse_media_stream_init(&payload).expect("parse init");
         assert_eq!(init.stage, 1);
         assert_eq!(init.base_udp_port, 0x1234);
         assert_eq!(init.stream_count, 0x0003);
         assert_eq!(init.next_stream_port, 0x0002);
+    }
+
+    #[test]
+    fn parse_media_stream_init_stage2() {
+        let payload = [
+            0x00, 0x0e, // payload_len = 14
+            0x00, 0x02, // version = 2
+            0x00, 0x02, // type = 2 (stage 2)
+            0x00, 0x00, // field6
+            0x00, 0x01, // field8
+            0x00, 0x00, // field10
+            0x00, 0x00, 0x00, 0x00, // field12
+        ];
+        let init = parse_media_stream_init(&payload).expect("parse init");
+        assert_eq!(init.stage, 2);
+    }
+
+    #[test]
+    fn parse_media_stream_init_version_zero() {
+        // Some macOS builds emit a (0,0) announcement as the first media-init
+        // hint. In this variant field6 carries the base UDP port and field10
+        // the stream count.
+        let payload = [
+            0x00, 0x0e, // payload_len = 14
+            0x00, 0x00, // version = 0
+            0x00, 0x00, // type = 0
+            0x17, 0x0c, // field6 = 5900 base UDP port
+            0x00, 0x00, // field8 = next stream port
+            0x00, 0x01, // field10 = stream count
+            0x17, 0x10, 0x17, 0x00, // field12 = 386727936
+        ];
+        let init = parse_media_stream_init(&payload).expect("parse init");
+        assert_eq!(init.stage, 1);
+        assert_eq!(init.base_udp_port, 5900);
+        assert_eq!(init.stream_count, 1);
+        assert_eq!(init.next_stream_port, 0);
     }
 }

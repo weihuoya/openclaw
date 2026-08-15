@@ -3,14 +3,14 @@ use std::rc::Rc;
 use adw::prelude::*;
 use glib::clone;
 use gtk4::{gio, glib};
-use gtk4_vnc::{HandshakeResult, VncDisplay};
+use gtk4_vnc::{HandshakeResult, HpOptions, VncDisplay};
 use vnc_client::auth::{AppleDhAuthHandler, NoAuthHandler, PasswordAuthHandler};
 
 use gettextrs::gettext;
 
 use crate::encoding::build_encoding_list;
 use crate::settings::{add_history_entry, HistoryEntry};
-use crate::ui::{ConnectionVisibilityFn, RefreshHistoryFn};
+use crate::ui::{media_stream_error_message, ConnectionVisibilityFn, RefreshHistoryFn};
 
 #[allow(clippy::too_many_arguments)]
 pub fn show_connect_dialog(
@@ -31,6 +31,8 @@ pub fn show_connect_dialog(
         let _ = settings.set_string("auth-method", &entry.auth_method);
         let _ = settings.set_boolean("use-tls", entry.use_tls);
         let _ = settings.set_string("preferred-encoding", &entry.preferred_encoding);
+        let _ = settings.set_boolean("high-performance", entry.high_performance);
+        let _ = settings.set_boolean("media-stream-h264", entry.media_stream_h264);
     }
 
     // Server group
@@ -110,6 +112,34 @@ pub fn show_connect_dialog(
     view_only_row.set_title(&gettext("View only"));
     settings.bind("view-only", &view_only_row, "active").build();
 
+    let hp_row = adw::SwitchRow::new();
+    hp_row.set_title(&gettext("Apple high-performance mode"));
+    hp_row.set_subtitle(&gettext("Required for H.264 media stream"));
+    settings.bind("high-performance", &hp_row, "active").build();
+
+    let media_stream_row = adw::SwitchRow::new();
+    media_stream_row.set_title(&gettext("H.264 media stream"));
+    media_stream_row.set_subtitle(&gettext("UDP/SRTP adaptive media path"));
+    media_stream_row.set_sensitive(settings.boolean("high-performance"));
+    settings
+        .bind("media-stream-h264", &media_stream_row, "active")
+        .build();
+
+    settings.connect_changed(
+        Some("high-performance"),
+        clone!(
+            #[weak]
+            media_stream_row,
+            move |settings, _key| {
+                let active = settings.boolean("high-performance");
+                media_stream_row.set_sensitive(active);
+                if !active {
+                    let _ = settings.set_boolean("media-stream-h264", false);
+                }
+            }
+        ),
+    );
+
     let scale_row = adw::SwitchRow::new();
     scale_row.set_title(&gettext("Scale to fit"));
     settings.bind("scale-to-fit", &scale_row, "active").build();
@@ -120,6 +150,8 @@ pub fn show_connect_dialog(
     options_group.add(&enc_row);
     options_group.add(&tls_row);
     options_group.add(&view_only_row);
+    options_group.add(&hp_row);
+    options_group.add(&media_stream_row);
     options_group.add(&scale_row);
 
     let preferences_page = adw::PreferencesPage::new();
@@ -204,6 +236,8 @@ pub fn show_connect_dialog(
                 auth_method: settings.string("auth-method").to_string(),
                 use_tls: settings.boolean("use-tls"),
                 preferred_encoding: settings.string("preferred-encoding").to_string(),
+                high_performance: settings.boolean("high-performance"),
+                media_stream_h264: settings.boolean("media-stream-h264"),
             };
             add_history_entry(&settings, entry);
             refresh_history();
@@ -233,6 +267,12 @@ pub fn show_connect_dialog(
         set_connection_visible,
         move |msg: String| {
             log::error!("VNC error: {}", msg);
+            if let Some(media_msg) = media_stream_error_message(&msg) {
+                // Media stream failures are non-fatal: keep the RFB connection
+                // alive and only notify the user that H.264 mode is unavailable.
+                dialog_toast_overlay.add_toast(adw::Toast::new(&media_msg));
+                return;
+            }
             dialog_toast_overlay.add_toast(adw::Toast::new(&msg));
             connect_btn.set_sensitive(true);
             connect_btn.set_label(&gettext("Connect"));
@@ -336,11 +376,24 @@ pub fn show_connect_dialog(
             };
 
             let use_tls = settings.boolean("use-tls");
+            let high_performance = settings.boolean("high-performance");
+            let media_stream_h264 = settings.boolean("media-stream-h264");
 
             let preferred = settings.string("preferred-encoding");
             let encodings = build_encoding_list(&preferred);
 
-            match vnc_display.connect_with_options(&host, port, use_tls, auth, &encodings) {
+            let hp_options = HpOptions {
+                high_performance,
+                media_stream_h264,
+                display_width: 1920,
+                display_height: 1080,
+                display_dynamic: true,
+                hidpi_scale: 2.0,
+            };
+
+            match vnc_display
+                .connect_with_hp_options(&host, port, use_tls, auth, &encodings, hp_options)
+            {
                 Ok(()) => {
                     dialog_connect_btn.set_sensitive(false);
                 }

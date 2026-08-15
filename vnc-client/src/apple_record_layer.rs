@@ -208,6 +208,12 @@ impl<S: Read + Write> AppleRecordLayer<S> {
         self.enc_seq = self.enc_seq.wrapping_add(1);
         let mut ciphertext = vec![0u8; total_len];
         self.cbc_encrypt(&frame, &mut ciphertext);
+        log::trace!(
+            "AppleRecordLayer write_record: body_len={} total_len={} first_byte=0x{:02x}",
+            body.len(),
+            total_len,
+            body.first().copied().unwrap_or(0)
+        );
         self.inner.write_all(&(total_len as u16).to_be_bytes())?;
         self.inner.write_all(&ciphertext)?;
         Ok(())
@@ -286,11 +292,13 @@ impl<S: Read + Write> AppleRecordLayer<S> {
         msg
     }
 
-    /// Build an encrypted Apple HP pointer-event message (0x10, subtype 3).
+    /// Build an encrypted Apple HP pointer-event message (0x10).
     ///
     /// The 16-byte plaintext block is AES-128-ECB-encrypted in place with the
     /// current record-layer content key. `button_mask` must be in the Apple HP
-    /// wire format (right/middle bits swapped relative to RFC 6143).
+    /// wire format (right/middle bits swapped relative to RFC 6143). Byte 1 of
+    /// the wire message is 0x00, matching the native client and the reference
+    /// implementation (iShareScreen sends `0x10 0x00 || ciphertext`).
     pub fn build_encrypted_pointer_event(&self, button_mask: u8, x: u16, y: u16) -> Vec<u8> {
         let mut plain = [0u8; BLOCK_LEN];
         // bytes 0..5 zero for ordinary move events
@@ -302,7 +310,7 @@ impl<S: Read + Write> AppleRecordLayer<S> {
 
         let mut msg = Vec::with_capacity(18);
         msg.push(protocol::apple::ENCRYPTED_INPUT_EVENT);
-        msg.push(0x03); // subtype 3 = legacy encrypted mouse event
+        msg.push(0x00); // pad; the native client sends 0x00 here
         msg.extend_from_slice(&self.encrypt_input_block(&plain));
         msg
     }
@@ -317,6 +325,23 @@ impl AppleRecordLayer<TcpStream> {
     /// Set TCP_NODELAY on the underlying socket.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.inner.set_nodelay(nodelay)
+    }
+
+    /// Return the peer address of the underlying TCP stream.
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    /// Read the remainder of the current decrypted record body.
+    ///
+    /// This is useful for message types whose payload length is not encoded
+    /// inside the message itself (e.g. Apple `0x1c` media-stream answer
+    /// rectangles carried inside a FramebufferUpdate record).
+    pub fn read_remaining_record(&mut self) -> io::Result<Vec<u8>> {
+        if self.read_buf.is_empty() {
+            self.read_buf = self.read_record()?;
+        }
+        Ok(std::mem::take(&mut self.read_buf))
     }
 }
 
@@ -375,9 +400,10 @@ pub fn build_viewer_info(extra: &[u8]) -> Vec<u8> {
         0xb0, 0, 0x0c, 0x03, 0x90, 0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0,
     ];
-    // 32-byte header: type(1) + reserved(1) + msgSize(2) + version(2) + app_id(4)
-    // + app_ver(12) + os_ver(12).
-    let msg_size = 32 + MASK.len() + extra.len();
+    // 34-byte header: type(1) + reserved(1) + msgSize(2) + version(2) + app_id(4)
+    // + app_ver(12) + os_ver(12).  msgSize covers the 30 bytes after the
+    // msgSize field plus the 32-byte command mask and any extra payload.
+    let msg_size = 30 + MASK.len() + extra.len();
     let mut msg = Vec::with_capacity(4 + msg_size);
     msg.push(protocol::apple::VIEWER_INFO);
     msg.push(0);
@@ -600,6 +626,11 @@ pub fn build_set_display_configuration(
                                                                     // display_info_region: 120 opaque bytes (D+0x02..=D+0x79), NUL at D+0x79.
     let info_region_start = msg.len();
     msg.resize(msg.len() + 120, 0);
+    // Match the reference client: write a display name into the opaque region.
+    // Keep it ≤ 119 bytes so the byte at D+0x79 remains NUL.
+    let display_name = b"OpenClaw Virtual Display";
+    let name_len = display_name.len().min(119);
+    msg[info_region_start..info_region_start + name_len].copy_from_slice(&display_name[..name_len]);
     // Ensure the byte at D+0x79 is NUL (already zero from resize).
     debug_assert_eq!(msg.len() - info_region_start, 120);
     msg.extend_from_slice(&display_flags.to_be_bytes());
@@ -895,7 +926,7 @@ mod tests {
         let msg = layer.build_encrypted_pointer_event(0x05, 100, 200);
         assert_eq!(msg.len(), 18);
         assert_eq!(msg[0], protocol::apple::ENCRYPTED_INPUT_EVENT);
-        assert_eq!(msg[1], 0x03); // subtype 3
+        assert_eq!(msg[1], 0x00); // pad byte (native client sends 0x00)
 
         let cipher = Aes128::new_from_slice(&layer.content_key).unwrap();
         let mut block = Block::<Aes128>::clone_from_slice(&msg[2..18]);
@@ -952,6 +983,19 @@ mod tests {
         assert_eq!(u16::from_be_bytes([msg[3], msg[4]]), 1); // message_version
         assert_eq!(u16::from_be_bytes([msg[5], msg[6]]), 23); // id_len
         assert_eq!(&msg[7..], b"com.apple.keylayout.ABC");
+    }
+
+    #[test]
+    fn viewer_info_format_matches_reference_size() {
+        let msg = build_viewer_info(&[]);
+        assert_eq!(msg[0], protocol::apple::VIEWER_INFO);
+        // The 4-byte prefix is followed by a 62-byte body (empty extra):
+        // version(2) + app_id(4) + app_ver(12) + os_ver(12) + 32-byte mask.
+        let msg_size = u16::from_be_bytes([msg[2], msg[3]]) as usize;
+        assert_eq!(msg_size, 62);
+        assert_eq!(msg.len(), 4 + msg_size);
+        assert_eq!(u16::from_be_bytes([msg[4], msg[5]]), 1); // version
+        assert_eq!(u32::from_be_bytes([msg[6], msg[7], msg[8], msg[9]]), 2); // app_id
     }
 
     #[test]

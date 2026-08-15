@@ -60,6 +60,10 @@ impl TlsStream {
     pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
         self.inner.get_ref().set_nodelay(nodelay)
     }
+
+    pub fn get_ref(&self) -> &TcpStream {
+        self.inner.get_ref()
+    }
 }
 
 impl Read for TlsStream {

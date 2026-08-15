@@ -17,6 +17,8 @@ pub struct MediaCodecDecoder {
     stride: Cell<usize>,
     /// Internal RGBA buffer, reused across frames.
     rgba_buffer: RefCell<Vec<u8>>,
+    /// Set when a fresh output frame was produced by the last feed.
+    frame_available: Cell<bool>,
 }
 
 impl MediaCodecDecoder {
@@ -30,6 +32,7 @@ impl MediaCodecDecoder {
             height: Cell::new(0),
             stride: Cell::new(0),
             rgba_buffer: RefCell::new(Vec::new()),
+            frame_available: Cell::new(false),
         })
     }
 
@@ -91,6 +94,7 @@ impl MediaCodecDecoder {
                 Ok(ndk::media::media_codec::DequeuedOutputBufferInfoResult::Buffer(buffer)) => {
                     let yuv = buffer.buffer();
                     self.convert_nv12_to_rgba(yuv, self.width.get(), self.height.get());
+                    self.frame_available.set(true);
                     let _ = self.codec.release_output_buffer(buffer, false);
                 }
                 Ok(ndk::media::media_codec::DequeuedOutputBufferInfoResult::TryAgainLater)
@@ -176,6 +180,23 @@ impl VideoDecoder for MediaCodecDecoder {
 
         self.feed_and_drain(data)?;
         Ok(self.rgba_buffer.borrow().clone())
+    }
+
+    fn try_decode_frame(&self, data: &[u8]) -> Result<Option<Vec<u8>>, VncError> {
+        if self.width.get() == 0 || self.height.get() == 0 {
+            return Err(VncError::Protocol(
+                "MediaCodec not configured with video size".to_string(),
+            ));
+        }
+
+        self.frame_available.set(false);
+        self.feed_and_drain(data)?;
+        if self.frame_available.get() {
+            self.frame_available.set(false);
+            Ok(Some(self.rgba_buffer.borrow().clone()))
+        } else {
+            Ok(None)
+        }
     }
 
     fn video_size(&self) -> Option<(u16, u16)> {

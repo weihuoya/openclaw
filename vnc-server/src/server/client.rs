@@ -286,7 +286,7 @@ pub struct VncClient {
     pub tight_encoder: TightEncoder,
     pub zlib_encoder: ZlibEncoder,
     pub zrle_encoder: ZrleEncoder,
-    pub openh264_encoder: Option<crate::encode::openh264::OpenH264Encoder>,
+    pub openh264_encoder: Option<crate::encode::h264::H264Encoder>,
     pub bandwidth_estimator: BandwidthEstimator,
     /// Fences sent to the client that have not yet been echoed back.
     pub pending_fences: VecDeque<PingFence>,
@@ -377,10 +377,7 @@ impl VncClient {
             tight_encoder: TightEncoder::new(),
             zlib_encoder: ZlibEncoder::new(),
             zrle_encoder: ZrleEncoder::new(),
-            openh264_encoder: crate::encode::openh264::OpenH264Encoder::new(
-                width as u32,
-                height as u32,
-            ),
+            openh264_encoder: crate::encode::h264::H264Encoder::new(width as u32, height as u32),
             bandwidth_estimator: BandwidthEstimator::new(50_000),
             pending_fences: VecDeque::new(),
             fence_cap_warned: false,
@@ -596,6 +593,27 @@ impl VncClient {
         self.send_rect(rect)
     }
 
+    /// Send a rectangle using the encoding specified in `rect.encoding`.
+    ///
+    /// This is a convenience dispatcher that routes to the correct send
+    /// method based on the rectangle's encoding type. It is useful when
+    /// the encoding may vary at runtime (e.g. fallback from OpenH264).
+    pub fn send_encoded_rect(&mut self, rect: &FbRect) -> io::Result<()> {
+        use vnc_protocol::encoding::Encoding;
+        match rect.encoding {
+            Encoding::Raw => self.send_raw_rect(rect),
+            Encoding::CopyRect => self.send_copyrect_rect(rect),
+            Encoding::Rre => self.send_rre_rect(rect),
+            Encoding::Hextile => self.send_hextile_rect(rect),
+            Encoding::Tight => self.send_tight_rect(rect),
+            Encoding::Zlib => self.send_zlib_rect(rect),
+            Encoding::Zrle => self.send_zrle_rect(rect),
+            Encoding::Trle => self.send_trle_rect(rect),
+            Encoding::OpenH264 => self.send_openh264_rect(rect),
+            _ => self.send_raw_rect(rect),
+        }
+    }
+
     /// Hand queued plaintext to the stream layer and flush it towards the
     /// socket.
     ///
@@ -697,6 +715,10 @@ impl VncClient {
                 self.bytes_at_last_response = ping.bytes_sent_at_send;
                 self.bytes_inflight = self.bytes_sent.saturating_sub(self.bytes_at_last_response);
                 self.bandwidth_estimator.record_sample(bytes_window, rtt_us);
+                // Adjust OpenH264 encoder bitrate based on bandwidth estimate.
+                if let Some(ref mut encoder) = self.openh264_encoder {
+                    encoder.set_bandwidth(self.bandwidth_estimator.bandwidth_bps());
+                }
                 debug!(
                     "Fence RTT: {} us, window: {} bytes, bandwidth: {:.0} bps",
                     rtt_us,
@@ -1221,6 +1243,12 @@ impl VncClient {
             // Non-incremental request: the client wants the full current
             // content of the requested region, regardless of what changed.
             self.damage.add_rect(req.x, req.y, req.width, req.height);
+            // A non-incremental request often means the client has lost
+            // decoder state (e.g. after an error or reconnection).
+            // Force a keyframe to ensure the next frame is decodable.
+            if let Some(ref mut encoder) = self.openh264_encoder {
+                encoder.request_keyframe();
+            }
         }
         Ok(FramebufferUpdateRequest::WIRE_LEN)
     }
@@ -1388,10 +1416,17 @@ impl VncClient {
 
     /// Update client dimensions and reset damage to a full-screen update.
     pub fn set_dimensions(&mut self, width: u16, height: u16) {
+        let changed = self.width != width || self.height != height;
         self.width = width;
         self.height = height;
         self.damage = ClientDamage::new(width as u32, height as u32);
         self.allow_copyrect = false;
+        // Reset the OpenH264 encoder when dimensions change.
+        if changed {
+            if let Some(ref mut encoder) = self.openh264_encoder {
+                encoder.reset(width as u32, height as u32);
+            }
+        }
     }
 
     /// Record a newly computed frame diff in this client's damage accumulator.

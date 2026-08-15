@@ -1,10 +1,12 @@
 pub mod copyrect;
 pub mod cursor;
+pub mod h264;
 pub mod hextile;
-pub mod openh264;
 pub mod raw;
 pub mod rre;
+pub mod rusty_h264;
 pub mod tight;
 pub mod trle;
+pub mod v4l2m2m;
 pub mod zlib;
 pub mod zrle;

@@ -20,7 +20,7 @@ use vnc_server::encode::raw::encode_raw;
 use vnc_server::encode::rre::encode_rre;
 use vnc_server::encode::trle::encode_trle;
 use vnc_server::perf::PerfStats;
-use vnc_server::protocol::Encoding;
+use vnc_server::protocol::{Encoding, FbRect};
 use vnc_server::server::client::{ClientState, VncClient, MAX_OUTBOUND_QUEUE};
 use vnc_server::server::listener::VncListener;
 use vnc_server::server::tls::build_tls_config;
@@ -756,8 +756,6 @@ fn main() {
                         client.damage.rects()
                     };
 
-                    let total_rects = copy_rects_to_send.len() + damage_rects_to_send.len();
-
                     let use_tight = client.has_encoding(Encoding::Tight);
                     let use_zrle = client.has_encoding(Encoding::Zrle);
                     let use_hextile = client.has_encoding(Encoding::Hextile);
@@ -766,6 +764,35 @@ fn main() {
                     let use_rre = client.has_encoding(Encoding::Rre);
                     let use_openh264 = client.has_encoding(Encoding::OpenH264)
                         && client.openh264_encoder.is_some();
+
+                    // OpenH264 is a full-frame video codec: encode the entire
+                    // framebuffer as one rectangle. This also avoids a
+                    // dimension mismatch between the encoder config (full
+                    // screen) and per-damage-rect calls.
+                    let mut openh264_rect: Option<FbRect> = None;
+                    if use_openh264 {
+                        if let Some(ref mut encoder) = client.openh264_encoder {
+                            let full_rect = encoder.encode(
+                                &fb.data,
+                                stride,
+                                0,
+                                0,
+                                client.width,
+                                client.height,
+                                &client.pixel_format,
+                            );
+                            if !full_rect.data.is_empty() {
+                                openh264_rect = Some(full_rect);
+                            }
+                        }
+                    }
+
+                    let total_rects = if openh264_rect.is_some() {
+                        1
+                    } else {
+                        copy_rects_to_send.len() + damage_rects_to_send.len()
+                    };
+
                     if let Err(e) = client.send_fb_update_header(total_rects as u16) {
                         warn!("Send header failed: {}", e);
                         continue;
@@ -774,27 +801,83 @@ fn main() {
                     let encode_start = Instant::now();
 
                     let mut send_ok = true;
-                    for copy_rect in &copy_rects_to_send {
-                        let enc_rect = encode_copyrect(
-                            copy_rect.src_x,
-                            copy_rect.src_y,
-                            copy_rect.x,
-                            copy_rect.y,
-                            copy_rect.width,
-                            copy_rect.height,
-                        );
-                        if let Err(e) = client.send_copyrect_rect(&enc_rect) {
-                            warn!("Send copyrect rect failed: {}", e);
+                    if let Some(rect) = openh264_rect {
+                        // OpenH264 path: the whole frame is already encoded as one rect.
+                        if let Err(e) = client.send_openh264_rect(&rect) {
+                            warn!("Send OpenH264 rect failed: {}", e);
                             send_ok = false;
-                            break;
                         }
-                    }
+                    } else {
+                        for copy_rect in &copy_rects_to_send {
+                            let enc_rect = encode_copyrect(
+                                copy_rect.src_x,
+                                copy_rect.src_y,
+                                copy_rect.x,
+                                copy_rect.y,
+                                copy_rect.width,
+                                copy_rect.height,
+                            );
+                            if let Err(e) = client.send_copyrect_rect(&enc_rect) {
+                                warn!("Send copyrect rect failed: {}", e);
+                                send_ok = false;
+                                break;
+                            }
+                        }
 
-                    if send_ok {
-                        for rect in &damage_rects_to_send {
-                            let enc_rect = if use_openh264 {
-                                if let Some(ref mut encoder) = client.openh264_encoder {
-                                    encoder.encode(
+                        if send_ok {
+                            for rect in &damage_rects_to_send {
+                                let enc_rect = if use_tight {
+                                    client.tight_encoder.encode(
+                                        &fb.data,
+                                        stride,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &client.pixel_format,
+                                    )
+                                } else if use_zrle {
+                                    client.zrle_encoder.encode_rect(
+                                        &fb.data,
+                                        stride,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &client.pixel_format,
+                                    )
+                                } else if use_hextile {
+                                    encode_hextile(
+                                        &fb.data,
+                                        stride,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &client.pixel_format,
+                                    )
+                                } else if use_trle {
+                                    encode_trle(
+                                        &fb.data,
+                                        stride,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &client.pixel_format,
+                                    )
+                                } else if use_zlib {
+                                    client.zlib_encoder.encode_rect(
+                                        &fb.data,
+                                        stride,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &client.pixel_format,
+                                    )
+                                } else if use_rre {
+                                    encode_rre(
                                         &fb.data,
                                         stride,
                                         rect.x,
@@ -804,100 +887,22 @@ fn main() {
                                         &client.pixel_format,
                                     )
                                 } else {
-                                    unreachable!()
+                                    encode_raw(
+                                        &fb.data,
+                                        stride,
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height,
+                                        &client.pixel_format,
+                                    )
+                                };
+                                let send_result = client.send_encoded_rect(&enc_rect);
+                                if let Err(e) = send_result {
+                                    warn!("Send rect failed: {}", e);
+                                    send_ok = false;
+                                    break;
                                 }
-                            } else if use_tight {
-                                client.tight_encoder.encode(
-                                    &fb.data,
-                                    stride,
-                                    rect.x,
-                                    rect.y,
-                                    rect.width,
-                                    rect.height,
-                                    &client.pixel_format,
-                                )
-                            } else if use_zrle {
-                                client.zrle_encoder.encode_rect(
-                                    &fb.data,
-                                    stride,
-                                    rect.x,
-                                    rect.y,
-                                    rect.width,
-                                    rect.height,
-                                    &client.pixel_format,
-                                )
-                            } else if use_hextile {
-                                encode_hextile(
-                                    &fb.data,
-                                    stride,
-                                    rect.x,
-                                    rect.y,
-                                    rect.width,
-                                    rect.height,
-                                    &client.pixel_format,
-                                )
-                            } else if use_trle {
-                                encode_trle(
-                                    &fb.data,
-                                    stride,
-                                    rect.x,
-                                    rect.y,
-                                    rect.width,
-                                    rect.height,
-                                    &client.pixel_format,
-                                )
-                            } else if use_zlib {
-                                client.zlib_encoder.encode_rect(
-                                    &fb.data,
-                                    stride,
-                                    rect.x,
-                                    rect.y,
-                                    rect.width,
-                                    rect.height,
-                                    &client.pixel_format,
-                                )
-                            } else if use_rre {
-                                encode_rre(
-                                    &fb.data,
-                                    stride,
-                                    rect.x,
-                                    rect.y,
-                                    rect.width,
-                                    rect.height,
-                                    &client.pixel_format,
-                                )
-                            } else {
-                                encode_raw(
-                                    &fb.data,
-                                    stride,
-                                    rect.x,
-                                    rect.y,
-                                    rect.width,
-                                    rect.height,
-                                    &client.pixel_format,
-                                )
-                            };
-                            let send_result = if use_openh264 {
-                                client.send_openh264_rect(&enc_rect)
-                            } else if use_tight {
-                                client.send_tight_rect(&enc_rect)
-                            } else if use_zrle {
-                                client.send_zrle_rect(&enc_rect)
-                            } else if use_hextile {
-                                client.send_hextile_rect(&enc_rect)
-                            } else if use_trle {
-                                client.send_trle_rect(&enc_rect)
-                            } else if use_zlib {
-                                client.send_zlib_rect(&enc_rect)
-                            } else if use_rre {
-                                client.send_rre_rect(&enc_rect)
-                            } else {
-                                client.send_raw_rect(&enc_rect)
-                            };
-                            if let Err(e) = send_result {
-                                warn!("Send rect failed: {}", e);
-                                send_ok = false;
-                                break;
                             }
                         }
                     }

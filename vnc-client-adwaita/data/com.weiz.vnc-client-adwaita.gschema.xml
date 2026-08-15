@@ -36,6 +36,16 @@
       <summary>View only</summary>
       <description>Do not send mouse or keyboard events to the server.</description>
     </key>
+    <key name="high-performance" type="b">
+      <default>false</default>
+      <summary>Apple high-performance mode</summary>
+      <description>Use RFB 003.889 and the encrypted Apple record layer (required for the H.264 media stream).</description>
+    </key>
+    <key name="media-stream-h264" type="b">
+      <default>false</default>
+      <summary>H.264 media stream</summary>
+      <description>Request the Apple HP UDP/SRTP H.264 adaptive media stream. Requires Apple high-performance mode.</description>
+    </key>
     <key name="scale-to-fit" type="b">
       <default>true</default>
       <summary>Scale to fit</summary>

@@ -147,3 +147,11 @@ msgstr ""
 #: data/com.weiz.vnc-client-adwaita.desktop.in
 msgid "A simple VNC client built with libadwaita and GTK4"
 msgstr ""
+
+#: src/ui/mod.rs
+msgid "H.264 media stream unavailable: the GStreamer decoder plugin (avdec_h264) is failed to load."
+msgstr ""
+
+#: src/ui/mod.rs
+msgid "H.264 media stream unavailable; the connection will continue in standard RFB mode."
+msgstr ""

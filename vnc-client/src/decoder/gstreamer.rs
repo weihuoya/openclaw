@@ -4,18 +4,24 @@ use std::sync::{Arc, Mutex, Once};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_app::{AppSink, AppSrc};
+use gstreamer_app::{AppSink, AppSrc, AppStreamType};
 use gstreamer_video as gst_video;
 
-use crate::{decoder::VideoDecoder, VncError};
+use crate::decoder::{Codec, VideoDecoder};
+use crate::VncError;
 
 static GST_INIT: Once = Once::new();
 
+/// Debug dump of every buffer pushed into the decoder. Each record is a
+/// 4-byte big-endian length followed by the payload, so the exact push
+/// boundaries (one per access unit in the Apple HP path) can be replayed
+/// offline with `examples/hevc_replay.rs`.
 fn debug_save_h264(data: &[u8]) {
     let Some(path) = std::env::var_os("OPENCLAW_H264_DEBUG") else {
         return;
     };
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(&(data.len() as u32).to_be_bytes());
         let _ = file.write_all(data);
     }
 }
@@ -58,7 +64,7 @@ fn log_message(msg: &gst::Message) {
         MessageView::StateChanged(state)
             if state.src().map(|s| s.path_string()).unwrap_or_default() != "pipeline" =>
         {
-            log::debug!(
+            log::trace!(
                 "GStreamer element {} state changed: {:?} -> {:?}",
                 state.src().map(|s| s.path_string()).unwrap_or_default(),
                 state.old(),
@@ -69,30 +75,12 @@ fn log_message(msg: &gst::Message) {
     }
 }
 
-fn log_pipeline_state(pipeline: &gst::Pipeline) {
-    let state = pipeline.current_state();
-    let pending = pipeline.pending_state();
-    log::debug!("Pipeline state: current={:?} pending={:?}", state, pending);
-
-    for elem in pipeline.iterate_elements().into_iter().flatten() {
-        let name = elem.path_string();
-        let current = elem.current_state();
-        let pending = elem.pending_state();
-        log::debug!(
-            "Element {} state: {:?} pending={:?}",
-            name,
-            current,
-            pending
-        );
-    }
-}
-
 fn log_pipeline_elements(pipeline: &gst::Pipeline) {
-    log::debug!("Pipeline elements:");
+    log::trace!("Pipeline elements:");
     for elem in pipeline.iterate_elements().into_iter().flatten() {
         let name = elem.path_string();
         let factory = elem.factory().map(|f| f.name().to_string());
-        log::debug!("  {} (factory: {:?})", name, factory);
+        log::trace!("  {} (factory: {:?})", name, factory);
     }
 }
 
@@ -136,19 +124,32 @@ fn nv12_to_rgba(
     rgba
 }
 
-fn build_decoder_pipeline() -> Result<(gst::Pipeline, AppSrc, AppSink), VncError> {
-    // Use avdec_h264 directly, bypassing h264parse. h264parse in byte-stream
-    // mode requires a trailing start code (or EOS) to flush the last access
-    // unit, which we cannot send after every live frame. By claiming the
-    // input is parsed and NAL-aligned, avdec_h264 can decode each pushed
-    // buffer immediately without needing an EOS.
-    let pipeline_str = "appsrc name=src format=bytes \
-        caps=video/x-h264,stream-format=(string)byte-stream,alignment=(string)nal,parsed=(boolean)true ! \
-        avdec_h264 ! videoconvert ! appsink name=sink";
+fn build_decoder_pipeline(codec: Codec) -> Result<(gst::Pipeline, AppSrc, AppSink), VncError> {
+    // H.264 and HEVC both run parser-less: the callers always push complete
+    // access units (AU-aligned byte-stream), which avdec decodes immediately.
+    // A parser element (h265parse) would additionally rewrite buffer
+    // timestamps, breaking the AU tag round-trip the tile compositor relies
+    // on, and hold back the final AU until the next one arrives.
+    let (caps, decoder) = match codec {
+        Codec::H264 => (
+            "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au,parsed=(boolean)true",
+            "avdec_h264",
+        ),
+        Codec::Hevc => (
+            "video/x-h265,stream-format=(string)byte-stream,alignment=(string)au,parsed=(boolean)true",
+            // Single-threaded: frame threading would delay output by several
+            // access units, and the tile compositor needs prompt 1:1 output.
+            "avdec_h265 max-threads=1",
+        ),
+    };
+    let pipeline_str = format!(
+        "appsrc name=src format=bytes caps={} ! {} ! videoconvert ! appsink name=sink",
+        caps, decoder
+    );
 
     log::debug!("Creating GStreamer pipeline: {}", pipeline_str);
 
-    let pipeline = gst::parse::launch(pipeline_str)
+    let pipeline = gst::parse::launch(&pipeline_str)
         .map_err(|e| VncError::Protocol(format!("Pipeline creation failed: {}", e)))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| VncError::Protocol("Failed to cast pipeline".to_string()))?;
@@ -166,6 +167,19 @@ fn build_decoder_pipeline() -> Result<(gst::Pipeline, AppSrc, AppSink), VncError
         .ok_or_else(|| VncError::Protocol("appsrc not found".to_string()))?
         .downcast::<AppSrc>()
         .map_err(|_| VncError::Protocol("Failed to cast appsrc".to_string()))?;
+
+    // Configure appsrc as a live streaming source. This is required for the
+    // h265parse element to output frames in real time: in byte-stream mode the
+    // parser only flushes an access unit when it sees the start of the next AU
+    // (or EOS). Treating the source as live with explicit timestamps lets it emit
+    // frames as soon as the next frame begins arriving.
+    appsrc.set_property("is-live", true);
+    appsrc.set_property("stream-type", AppStreamType::Stream);
+    appsrc.set_property("format", gst::Format::Time);
+    // do-timestamp must stay off: the Apple HP tile path stamps every access
+    // unit with an explicit PTS tag that has to round-trip to the decoded
+    // sample, and appsrc would otherwise overwrite it with the running time.
+    appsrc.set_property("do-timestamp", false);
 
     let appsink = pipeline
         .by_name("sink")
@@ -202,23 +216,36 @@ struct DecoderState {
     last_video_size: Option<(u16, u16)>,
 }
 
-/// H264 decoder using GStreamer.
+/// H.264 / HEVC decoder using GStreamer.
 ///
-/// Pipeline: appsrc -> avdec_h264 -> videoconvert -> appsink
+/// Pipelines:
+/// - H.264: `appsrc -> avdec_h264 -> videoconvert -> appsink`
+/// - HEVC: `appsrc -> h265parse -> avdec_h265 -> videoconvert -> appsink`
 ///
-/// `avdec_h264` is used directly because `h264parse` requires a trailing
-/// start code or EOS to flush the final access unit, which is not available
-/// when decoding a live stream one frame at a time.
+/// H.264 uses `avdec_h264` directly with `parsed=true` because it can decode
+/// each NAL-aligned buffer immediately. HEVC needs `h265parse` because
+/// `avdec_h265` will not negotiate without a parser in byte-stream mode.
+///
+/// `h265parse` in byte-stream mode needs the next access unit (or EOS) to
+/// flush the previous one when input is NAL-aligned. The Apple HP media path
+/// avoids that latency entirely by buffering complete AUs per tile stream and
+/// declaring `alignment=au`, so the parser forwards each buffer immediately.
+/// `do-timestamp` stays off so explicit PTS tags stamped by the caller (Apple
+/// HP tile composition) survive to the output.
 pub struct GStreamerDecoder {
     state: Arc<Mutex<DecoderState>>,
 }
 
 impl GStreamerDecoder {
     pub fn new() -> Result<Self, VncError> {
+        Self::for_codec(Codec::H264)
+    }
+
+    pub fn for_codec(codec: Codec) -> Result<Self, VncError> {
         init_gstreamer()?;
         debug_clear_h264_dump();
 
-        let (pipeline, appsrc, appsink) = build_decoder_pipeline()?;
+        let (pipeline, appsrc, appsink) = build_decoder_pipeline(codec)?;
 
         Ok(Self {
             state: Arc::new(Mutex::new(DecoderState {
@@ -230,36 +257,16 @@ impl GStreamerDecoder {
             })),
         })
     }
-
-    fn try_decode(&self, data: &[u8], timeout_ns: u64) -> Result<Option<gst::Sample>, VncError> {
-        let state = self.state.lock().unwrap();
-        let buffer = gst::Buffer::from_slice(data.to_vec());
-        state
-            .appsrc
-            .push_buffer(buffer)
-            .map_err(|e| VncError::Protocol(format!("Push buffer failed: {}", e)))?;
-
-        let sample = state
-            .appsink
-            .try_pull_sample(gst::ClockTime::from_nseconds(timeout_ns));
-        Ok(sample)
-    }
 }
 
 impl VideoDecoder for GStreamerDecoder {
     fn decode_frame(&self, data: &[u8]) -> Result<Vec<u8>, VncError> {
-        if data.is_empty() {
-            return Err(VncError::Protocol("Empty H264 frame".to_string()));
-        }
+        self.push(data)?;
 
-        let first_16: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
-        log::debug!(
-            "Pushing H264 frame to GStreamer, {} bytes, first bytes: {}",
-            data.len(),
-            first_16.join(" ")
-        );
-        debug_save_h264(data);
-
+        // Synchronous path (RFB OpenH264 rectangles): the caller expects the
+        // decoded pixels right away, so block until the pipeline produces a
+        // sample. The first frame gets a generous timeout while the decoder
+        // negotiates caps.
         let is_first = {
             let state = self.state.lock().unwrap();
             state.first_frame_pending
@@ -269,14 +276,116 @@ impl VideoDecoder for GStreamerDecoder {
         } else {
             500 * 1_000_000u64
         };
+        let sample = self.pull_sample(timeout_ns)?;
+        let sample = sample
+            .ok_or_else(|| VncError::Protocol("Video decode timeout or no output".to_string()))?;
+        self.sample_to_rgba(sample)
+    }
 
-        let sample = self.try_decode(data, timeout_ns)?;
-        let sample = sample.ok_or_else(|| {
-            let state = self.state.lock().unwrap();
-            log_pipeline_state(&state.pipeline);
-            VncError::Protocol("H264 decode timeout or no output".to_string())
-        })?;
+    fn try_decode_frame(&self, data: &[u8]) -> Result<Option<Vec<u8>>, VncError> {
+        self.push(data)?;
 
+        // Streaming path (Apple HP media stream): never block the caller. The
+        // receiver thread feeds NAL units back-to-back and must stay
+        // responsive to incoming UDP packets and RTCP feedback; a sample that
+        // is not ready yet is picked up on a later call.
+        let sample = self.pull_sample(0)?;
+        match sample {
+            Some(sample) => self.sample_to_rgba(sample).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn decode_au(&self, data: &[u8], pts: u64) -> Result<Option<(u64, Vec<u8>)>, VncError> {
+        self.push_tagged(data, Some(pts))?;
+
+        // Non-blocking pull, same as try_decode_frame. The output sample
+        // carries the PTS of the access unit it was decoded from (appsrc
+        // do-timestamp is disabled, so our tag survives), letting the caller
+        // map it back to the originating tile/access unit.
+        let sample = self.pull_sample(0)?;
+        match sample {
+            Some(sample) => self.sample_to_tagged_rgba(sample).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn poll_decoded(&self) -> Result<Option<(u64, Vec<u8>)>, VncError> {
+        let sample = self.pull_sample(0)?;
+        match sample {
+            Some(sample) => self.sample_to_tagged_rgba(sample).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn video_size(&self) -> Option<(u16, u16)> {
+        let state = self.state.lock().unwrap();
+        state.last_video_size
+    }
+}
+
+impl GStreamerDecoder {
+    /// Push a buffer into the pipeline.
+    fn push(&self, data: &[u8]) -> Result<(), VncError> {
+        self.push_tagged(data, None)
+    }
+
+    /// Push a buffer into the pipeline, optionally stamping it with an
+    /// explicit PTS (nanoseconds; used as an opaque access-unit tag that
+    /// round-trips to the decoded output sample).
+    fn push_tagged(&self, data: &[u8], pts: Option<u64>) -> Result<(), VncError> {
+        if data.is_empty() {
+            return Err(VncError::Protocol("Empty video frame".to_string()));
+        }
+
+        let first_16: Vec<String> = data.iter().take(16).map(|b| format!("{:02x}", b)).collect();
+        log::trace!(
+            "Pushing video frame to GStreamer, {} bytes, first bytes: {}",
+            data.len(),
+            first_16.join(" ")
+        );
+        debug_save_h264(data);
+
+        let state = self.state.lock().unwrap();
+        let mut buffer = gst::Buffer::from_slice(data.to_vec());
+        if let Some(pts) = pts {
+            let buf = buffer
+                .get_mut()
+                .ok_or_else(|| VncError::Protocol("Failed to map buffer as mutable".to_string()))?;
+            buf.set_pts(gst::ClockTime::from_nseconds(pts));
+        }
+        state
+            .appsrc
+            .push_buffer(buffer)
+            .map_err(|e| VncError::Protocol(format!("Push buffer failed: {}", e)))?;
+        Ok(())
+    }
+
+    /// Pull a decoded sample from the appsink, waiting at most `timeout_ns`
+    /// nanoseconds (0 = non-blocking).
+    fn pull_sample(&self, timeout_ns: u64) -> Result<Option<gst::Sample>, VncError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .appsink
+            .try_pull_sample(gst::ClockTime::from_nseconds(timeout_ns)))
+    }
+
+    /// Convert a decoded sample to its access-unit tag plus RGBA pixels.
+    ///
+    /// The tag round-trips through the buffer PTS (the pipeline has no parser
+    /// element, so avdec passes the pushed PTS through to the output frame).
+    fn sample_to_tagged_rgba(&self, sample: gst::Sample) -> Result<(u64, Vec<u8>), VncError> {
+        let out_pts = sample
+            .buffer()
+            .and_then(|b| b.pts())
+            .map(|t| t.nseconds())
+            .unwrap_or(0);
+        let rgba = self.sample_to_rgba(sample)?;
+        Ok((out_pts, rgba))
+    }
+
+    /// Convert a decoded sample to RGBA and update the decoder state.
+    fn sample_to_rgba(&self, sample: gst::Sample) -> Result<Vec<u8>, VncError> {
         {
             let mut state = self.state.lock().unwrap();
             state.first_frame_pending = false;
@@ -299,7 +408,7 @@ impl VideoDecoder for GStreamerDecoder {
 
         let rgba = match info.format() {
             gst_video::VideoFormat::Rgba => {
-                log::debug!(
+                log::trace!(
                     "GStreamer decoder produced RGBA {}x{}",
                     info.width(),
                     info.height()
@@ -310,7 +419,7 @@ impl VideoDecoder for GStreamerDecoder {
                 map.as_ref().to_vec()
             }
             gst_video::VideoFormat::Nv12 => {
-                log::debug!(
+                log::trace!(
                     "GStreamer decoder produced NV12 {}x{}; converting to RGBA",
                     info.width(),
                     info.height()
@@ -351,11 +460,6 @@ impl VideoDecoder for GStreamerDecoder {
 
         Ok(rgba)
     }
-
-    fn video_size(&self) -> Option<(u16, u16)> {
-        let state = self.state.lock().unwrap();
-        state.last_video_size
-    }
 }
 
 impl Drop for GStreamerDecoder {
@@ -385,5 +489,60 @@ mod tests {
         let (w, h) = decoder.video_size().expect("video size");
         assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
         assert_eq!((w, h), (320, 240));
+    }
+
+    #[test]
+    fn decode_fixture_hevc_frame() {
+        // Regression test for the HEVC decoding path. The fixture is a single
+        // Annex-B access unit (VPS + SPS + PPS + IDR) captured from an Apple HP
+        // session. The input caps declare alignment=au (the media path always
+        // pushes complete access units), so a single push decodes immediately;
+        // poll a few times to absorb scheduling jitter.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("hevc_au.bin");
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {}: {}", path.display(), e));
+        let decoder = GStreamerDecoder::for_codec(Codec::Hevc).expect("create decoder");
+        let mut rgba = None;
+        for _ in 0..200 {
+            if let Some(frame) = decoder.try_decode_frame(&data).expect("push ok") {
+                rgba = Some(frame);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let rgba = rgba.expect("decoder should emit a frame");
+        let (w, h) = decoder.video_size().expect("video size");
+        assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
+        assert_eq!((w, h), (1920, 272));
+    }
+
+    #[test]
+    fn decode_au_pts_roundtrips_to_output() {
+        // The Apple HP tile compositor relies on the PTS tag stamped on each
+        // pushed access unit being carried through to the decoded sample.
+        // Push the fixture AU with distinct tags; every output must carry one
+        // of those tags.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("hevc_au.bin");
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {}: {}", path.display(), e));
+        let decoder = GStreamerDecoder::for_codec(Codec::Hevc).expect("create decoder");
+        let mut seen = None;
+        for pts in 1..200u64 {
+            if let Some((out_pts, rgba)) = decoder.decode_au(&data, pts).expect("push ok") {
+                seen = Some((out_pts, rgba));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (out_pts, rgba) = seen.expect("decoder should emit a frame");
+        assert!(out_pts >= 1 && out_pts < 200, "unexpected pts {}", out_pts);
+        let (w, h) = decoder.video_size().expect("video size");
+        assert_eq!(rgba.len(), (w as usize) * (h as usize) * 4);
     }
 }

@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 
 use crate::VncError;
 use tungstenite::protocol::WebSocket;
@@ -31,6 +31,11 @@ impl WsStream {
             read_pos: 0,
             write_buf: Vec::new(),
         })
+    }
+
+    /// Return the peer address of the underlying WebSocket stream.
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        Err(std::io::Error::other("WebSocket peer address unavailable"))
     }
 
     fn fill_buffer(&mut self) -> std::io::Result<()> {

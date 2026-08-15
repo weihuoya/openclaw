@@ -13,6 +13,8 @@ pub struct HistoryEntry {
     pub auth_method: String,
     pub use_tls: bool,
     pub preferred_encoding: String,
+    pub high_performance: bool,
+    pub media_stream_h264: bool,
 }
 
 impl HistoryEntry {

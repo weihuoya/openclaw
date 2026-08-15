@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use vnc_client::auth::{AuthHandler, NoAuthHandler};
 use vnc_client::cursor::CursorShape;
 use vnc_client::encodings::Encoding;
-use vnc_client::{ConnectionStats, VncClient, VncEvent};
+use vnc_client::{ConnectionStats, VncClient, VncClientBuilder, VncEvent};
+
+use vnc_client::apple_media::{MediaStreamAnswer, MediaStreamInit, MediaStreamKeys};
+use vnc_client::decoder::Codec;
 
 use super::paintable::VncPaintable;
 
@@ -72,6 +75,26 @@ pub struct HandshakeResult {
     pub error: Option<String>,
     /// Security types advertised by the server during the handshake attempt.
     pub supported_auth_types: Vec<u8>,
+}
+
+/// Apple high-performance mode options for a connection.
+///
+/// When `high_performance` is false, all other fields are ignored and the
+/// connection uses the standard RFB path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HpOptions {
+    /// Enable Apple HP protocol (RFB 003.889 + encrypted record layer).
+    pub high_performance: bool,
+    /// Request the HEVC adaptive media stream after the record layer is active.
+    pub media_stream_h264: bool,
+    /// Virtual display width sent in `SetDisplayConfiguration` (0x1d).
+    pub display_width: u16,
+    /// Virtual display height sent in `SetDisplayConfiguration` (0x1d).
+    pub display_height: u16,
+    /// Request a dynamic-resolution virtual display.
+    pub display_dynamic: bool,
+    /// HiDPI backing:point scale factor (1.0 = 1:1, 2.0 = Retina).
+    pub hidpi_scale: f32,
 }
 
 /// Framebuffer update data received from the background thread.
@@ -265,10 +288,16 @@ mod imp {
 
         pub fn send_input(&self, event: InputEvent) {
             if self.view_only.get() {
+                log::debug!("input event dropped: view-only mode");
                 return;
             }
-            if let Some(ref tx) = *self.input_tx.borrow() {
-                let _ = tx.send(event);
+            match *self.input_tx.borrow() {
+                Some(ref tx) => {
+                    let _ = tx.send(event);
+                }
+                None => {
+                    log::debug!("input event dropped: no active connection");
+                }
             }
         }
 
@@ -286,10 +315,12 @@ mod imp {
         fn on_button_press(&self, button: u8, x: f64, y: f64) {
             self.obj().grab_focus();
             let (vx, vy) = self.scale_coords(x, y);
+            // RFC 6143 layout (bit1 = middle, bit2 = right); the client
+            // applies the Apple HP right/middle swap itself when needed.
             let bit = match button {
                 1 => 1 << 0,
-                2 => 1 << 2,
-                3 => 1 << 1,
+                2 => 1 << 1,
+                3 => 1 << 2,
                 _ => 0,
             };
             let mask = self.button_mask.get() | bit;
@@ -305,8 +336,8 @@ mod imp {
             let (vx, vy) = self.scale_coords(x, y);
             let bit = match button {
                 1 => 1 << 0,
-                2 => 1 << 2,
-                3 => 1 << 1,
+                2 => 1 << 1,
+                3 => 1 << 2,
                 _ => 0,
             };
             let mask = self.button_mask.get() & !bit;
@@ -439,7 +470,9 @@ impl VncDisplay {
     /// Connect to a VNC server with explicit connection options and authentication.
     ///
     /// Errors from the background thread are delivered to the callback set with
-    /// [`Self::set_error_callback`] on the main thread.
+    /// [`Self::set_error_callback`] on the main thread. This is a convenience
+    /// wrapper around [`Self::connect_with_hp_options`] that uses standard RFB
+    /// mode (Apple high-performance features are disabled).
     pub fn connect_with_options(
         &self,
         host: &str,
@@ -447,6 +480,28 @@ impl VncDisplay {
         use_tls: bool,
         auth: Box<dyn AuthHandler + Send>,
         encodings: &[Encoding],
+    ) -> Result<(), String> {
+        self.connect_with_hp_options(host, port, use_tls, auth, encodings, HpOptions::default())
+    }
+
+    /// Connect to a VNC server with Apple high-performance options.
+    ///
+    /// When `hp_options.high_performance` is true, the client is built with
+    /// [`VncClientBuilder`] and the Apple HP record layer is negotiated. If
+    /// `hp_options.media_stream_h264` is also true, the `0x1c` media stream
+    /// options are sent after the record layer is active and decoded
+    /// [`VncEvent::MediaFrame`] frames are rendered just like framebuffer updates.
+    ///
+    /// Errors from the background thread are delivered to the callback set with
+    /// [`Self::set_error_callback`] on the main thread.
+    pub fn connect_with_hp_options(
+        &self,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        auth: Box<dyn AuthHandler + Send>,
+        encodings: &[Encoding],
+        hp_options: HpOptions,
     ) -> Result<(), String> {
         let imp = self.imp();
         imp.disconnect_internal();
@@ -475,11 +530,33 @@ impl VncDisplay {
         let addr = format!("{}:{}", host, port);
         let host = host.to_string();
         let encodings = encodings.to_vec();
-        log::debug!("Connecting to {} with encodings: {:?}", addr, encodings);
+        log::debug!(
+            "Connecting to {} with encodings: {:?}, hp_options: {:?}",
+            addr,
+            encodings,
+            hp_options
+        );
 
         // Background thread
         thread::spawn(move || {
-            let mut client = VncClient::new();
+            let encodings_empty = encodings.is_empty();
+
+            let mut client = if hp_options.high_performance {
+                let mut builder = VncClientBuilder::new()
+                    .pixel_format(vnc_client::PixelFormat::bgra32())
+                    .high_performance(true)
+                    .apple_display_size(hp_options.display_width, hp_options.display_height)
+                    .apple_display_dynamic(hp_options.display_dynamic)
+                    .apple_hidpi_scale(hp_options.hidpi_scale)
+                    .apple_media_stream_h264(hp_options.media_stream_h264);
+                if !encodings_empty {
+                    builder = builder.encodings(encodings.clone());
+                }
+                builder.build()
+            } else {
+                VncClient::new()
+            };
+
             let connect_result = if use_tls {
                 client.set_host(&host);
                 client.connect_tls(&host, port)
@@ -528,24 +605,126 @@ impl VncDisplay {
                     supported_auth_types: supported,
                 });
 
+            // In standard RFB mode we still set the pixel format and encodings here
+            // for compatibility with callers that use VncClient::new(). In Apple HP mode
+            // the VncClientBuilder already configured these before the handshake.
             let cursor_data = cursor_data.clone();
-            // Most VNC servers default to little-endian BGRA; keep the previous
-            // behavior while the pixel-format helpers are now correctly named.
-            let server_format = *client.pixel_format();
-            if let Err(e) = client.set_pixel_format(vnc_client::PixelFormat::bgra32()) {
-                log::warn!(
-                    "Failed to set pixel format to BGRA32 ({}); using server format {:?}",
-                    e,
-                    server_format
-                );
+            if !hp_options.high_performance {
+                let server_format = *client.pixel_format();
+                if let Err(e) = client.set_pixel_format(vnc_client::PixelFormat::bgra32()) {
+                    log::warn!(
+                        "Failed to set pixel format to BGRA32 ({}); using server format {:?}",
+                        e,
+                        server_format
+                    );
+                } else {
+                    log::debug!("Pixel format set to BGRA32");
+                }
+                if !encodings_empty {
+                    let _ = client.set_encodings(&encodings);
+                }
             } else {
-                log::debug!("Pixel format set to BGRA32");
-            }
-            if !encodings.is_empty() {
-                let _ = client.set_encodings(&encodings);
+                log::debug!("Apple HP mode active; pixel format and encodings were set by builder");
             }
 
-            // Request initial full update
+            let mut last_activity = Instant::now();
+            let mut last_stats_sample = Instant::now();
+            let mut last_update_request = Instant::now();
+            let mut first_frame_received = false;
+            #[cfg(not(target_os = "android"))]
+            let mut media_stream_started = false;
+            #[cfg(not(target_os = "android"))]
+            let mut last_media_offer_time: Option<Instant> = None;
+
+            // Negotiate the Apple HEVC media stream if requested. In Apple HP mode
+            // the 0x1c offer is sent automatically during VncClient::handshake
+            // immediately after the encrypted SetEncodings. Retrieve the keys the
+            // handshake generated; fall back to sending the offer here if the
+            // builder did not enable the media stream path.
+            let mut media_keys: Option<MediaStreamKeys> = None;
+            let mut media_answer: Option<MediaStreamAnswer> = None;
+            #[cfg(not(target_os = "android"))]
+            let mut bound_base_port: u16 = 0;
+            #[cfg(not(target_os = "android"))]
+            if hp_options.high_performance && hp_options.media_stream_h264 {
+                if let Some(keys) = client.apple_media_stream_keys() {
+                    log::debug!("Using Apple HP media stream keys from handshake");
+                    media_keys = Some(keys.clone());
+                    last_media_offer_time = Some(Instant::now());
+                } else {
+                    log::debug!("Sending Apple HP media stream options");
+                    match client.send_hp_media_stream_options(true) {
+                        Ok(keys) => {
+                            log::debug!("Apple HP media stream keys generated");
+                            media_keys = Some(keys);
+                            last_media_offer_time = Some(Instant::now());
+                        }
+                        Err(e) => {
+                            log::error!("Failed to send media stream options: {}", e);
+                        }
+                    }
+                }
+
+                // Pre-bind UDP sockets before the encoder burst. The reference
+                // client binds ports 5900/5901 first, then sends the 0x1c offer;
+                // Mac's RTP burst can land within ~100 ms of the answer and the
+                // kernel drops early packets if nothing is listening.
+                if let Some(keys) = media_keys.as_ref() {
+                    let assumed_init = MediaStreamInit {
+                        stage: 1,
+                        base_udp_port: 5900,
+                        stream_count: 1,
+                        next_stream_port: 0,
+                    };
+                    let (fb_w, fb_h) = client.dimensions();
+                    match client.start_media_stream(
+                        keys.clone(),
+                        assumed_init,
+                        fb_w,
+                        fb_h,
+                        Codec::Hevc,
+                    ) {
+                        Ok(()) => {
+                            log::info!(
+                                "Apple HP media stream pre-bound on UDP {}/{} (assumed base 5900)",
+                                5900,
+                                5901
+                            );
+                            bound_base_port = 5900;
+                            media_stream_started = true;
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to pre-bind Apple HP media stream sockets: {}", e);
+                        }
+                    }
+                }
+            }
+            #[cfg(target_os = "android")]
+            if hp_options.media_stream_h264 {
+                log::warn!("Apple HP media stream is not supported on Android");
+            }
+
+            // Apple HP media mode changes the TCP-side update policy: video
+            // flows over UDP, so the aggressive full-screen
+            // FramebufferUpdateRequest polling below is replaced by a light
+            // 1x1 cursor poll (see the loop). Full-screen requests during the
+            // ~2 s media-burst window after a 0x1c offer make the daemon
+            // answer with parameter-set-less updates and destabilise the RTP
+            // stream.
+            #[cfg(not(target_os = "android"))]
+            let hp_media = hp_options.high_performance && hp_options.media_stream_h264;
+            #[cfg(target_os = "android")]
+            let hp_media = false;
+            #[cfg(target_os = "android")]
+            let last_media_offer_time: Option<Instant> = None;
+            // Last geometry for which a 0x1c re-offer was sent (0x451
+            // layout changes require a re-offer with the same keys).
+            #[cfg(not(target_os = "android"))]
+            let mut last_layout_dims: Option<(u16, u16)> = None;
+
+            // Request initial full update. In Apple HP mode the handshake already
+            // sent a non-incremental FramebufferUpdateRequest after the 0x1c offer;
+            // this extra request is harmless and helps non-HP paths.
             let (w, h) = client.dimensions();
             let _ = client.request_update(false, 0, 0, w, h);
 
@@ -561,21 +740,60 @@ impl VncDisplay {
             // Set read timeout so we can check input channel periodically
             let _ = client.set_read_timeout(Some(Duration::from_millis(50)));
 
-            let mut last_activity = Instant::now();
-            let mut last_stats_sample = Instant::now();
-            let mut last_update_request = Instant::now();
-            let mut first_frame_received = false;
-
             while running_bg.load(Ordering::SeqCst) {
                 // Check for input events
                 while let Ok(event) = input_rx.try_recv() {
                     last_activity = Instant::now();
                     match event {
                         InputEvent::Pointer { button_mask, x, y } => {
-                            let _ = client.send_pointer_event(button_mask, x, y);
+                            // Apple HP: pointer coordinates are in logical
+                            // points (the 0x451 scaled geometry), while the
+                            // widget tracks backing pixels. Convert here.
+                            let (x, y) = if hp_options.high_performance {
+                                match client.apple_scaled_size() {
+                                    Some((sw, sh)) => {
+                                        let (fw, fh) = client.dimensions();
+                                        if fw > 0 && fh > 0 && (sw, sh) != (fw, fh) {
+                                            (
+                                                (x as u32 * sw as u32 / fw as u32) as u16,
+                                                (y as u32 * sh as u32 / fh as u32) as u16,
+                                            )
+                                        } else {
+                                            (x, y)
+                                        }
+                                    }
+                                    None => (x, y),
+                                }
+                            } else {
+                                (x, y)
+                            };
+                            // Apple HP: the stock client wraps every pointer
+                            // event in the encrypted 0x10 message; plaintext
+                            // 0x05 PointerEvent is a second-class path there
+                            // (no cursor-tracker side effects).
+                            let r = if hp_options.high_performance {
+                                client.send_hp_pointer_event(button_mask, x, y)
+                            } else {
+                                client.send_pointer_event(button_mask, x, y)
+                            };
+                            if button_mask != 0 {
+                                log::info!(
+                                    "pointer input sent: mask={:#x} x={} y={} (err={:?})",
+                                    button_mask,
+                                    x,
+                                    y,
+                                    r.as_ref().err()
+                                );
+                            }
                         }
                         InputEvent::Key { down, keysym } => {
-                            let _ = client.send_key_event(down, keysym);
+                            let r = client.send_key_event(down, keysym);
+                            log::info!(
+                                "key input sent: down={} keysym={:#x} (err={:?})",
+                                down,
+                                keysym,
+                                r.as_ref().err()
+                            );
                         }
                         InputEvent::RequestUpdate {
                             incremental,
@@ -589,26 +807,45 @@ impl VncDisplay {
                     }
                 }
 
-                // Heartbeat: request an incremental update every 5 seconds to keep the connection alive.
-                if last_activity.elapsed() >= Duration::from_secs(5) {
-                    let (w, h) = client.dimensions();
-                    let _ = client.request_update(true, 0, 0, w, h);
-                    last_activity = Instant::now();
-                }
+                if hp_media {
+                    // Apple HP media mode: video arrives over UDP; the TCP
+                    // channel only needs a light 1x1 incremental poll (~2 Hz)
+                    // to keep cursor pseudo-encodings flowing. Stay quiet
+                    // during the media-burst window after each 0x1c offer:
+                    // full-screen requests there make the daemon answer with
+                    // parameter-set-less updates and destabilise the stream.
+                    let in_burst_window = last_media_offer_time
+                        .map(|t| t.elapsed() < Duration::from_millis(2500))
+                        .unwrap_or(false);
+                    if !in_burst_window
+                        && last_update_request.elapsed() >= Duration::from_millis(500)
+                    {
+                        let _ = client.request_update(true, 0, 0, 1, 1);
+                        last_update_request = Instant::now();
+                        last_activity = Instant::now();
+                    }
+                } else {
+                    // Heartbeat: request an incremental update every 5 seconds to keep the connection alive.
+                    if last_activity.elapsed() >= Duration::from_secs(5) {
+                        let (w, h) = client.dimensions();
+                        let _ = client.request_update(true, 0, 0, w, h);
+                        last_activity = Instant::now();
+                    }
 
-                // Poll for updates when continuous updates are not enabled.
-                // Until the first full frame has been received, request a
-                // non-incremental update so that the decoder always gets a key
-                // frame first. Some servers send a P-frame in response to an
-                // incremental request, which breaks H264 decoders that have not
-                // yet seen an IDR.
-                if !continuous_updates
-                    && last_update_request.elapsed() >= Duration::from_millis(100)
-                {
-                    let (w, h) = client.dimensions();
-                    let incremental = first_frame_received;
-                    let _ = client.request_update(incremental, 0, 0, w, h);
-                    last_update_request = Instant::now();
+                    // Poll for updates when continuous updates are not enabled.
+                    // Until the first full frame has been received, request a
+                    // non-incremental update so the decoder always gets a key
+                    // frame first. Some servers send a P-frame in response to an
+                    // incremental request, which breaks H264 decoders that have not
+                    // yet seen an IDR.
+                    if !continuous_updates
+                        && last_update_request.elapsed() >= Duration::from_millis(100)
+                    {
+                        let (w, h) = client.dimensions();
+                        let incremental = first_frame_received;
+                        let _ = client.request_update(incremental, 0, 0, w, h);
+                        last_update_request = Instant::now();
+                    }
                 }
 
                 // Read server messages (with timeout)
@@ -622,7 +859,45 @@ impl VncDisplay {
                                     updated = true;
                                     first_frame_received = true;
                                 }
-                                VncEvent::GeometryChanged { .. } => resized = true,
+                                VncEvent::GeometryChanged { width, height } => {
+                                    resized = true;
+                                    // Apple HP: after a 0x451 layout change the
+                                    // server expects a fresh 0x1c offer (same
+                                    // SRTP keys); without it the server stops
+                                    // emitting media. Re-offer once per distinct
+                                    // geometry and request a keyframe for the
+                                    // restarted encoder burst.
+                                    #[cfg(not(target_os = "android"))]
+                                    if hp_media && last_layout_dims != Some((width, height)) {
+                                        last_layout_dims = Some((width, height));
+                                        // Tell the media worker the backing-store
+                                        // geometry so the tile composition canvas
+                                        // crops CTU padding correctly.
+                                        let _ = client.set_media_stream_size(width, height);
+                                        if let Some(keys) = media_keys.as_ref() {
+                                            log::info!(
+                                                "Apple HP: re-offering media stream options after layout change to {}x{}",
+                                                width,
+                                                height
+                                            );
+                                            match client.send_hp_media_stream_options_with_keys(
+                                                keys.clone(),
+                                                true,
+                                            ) {
+                                                Ok(()) => {
+                                                    last_media_offer_time = Some(Instant::now());
+                                                    client.request_media_keyframe();
+                                                }
+                                                Err(e) => {
+                                                    log::error!(
+                                                        "Failed to re-offer media stream options: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 VncEvent::CursorShape(shape) => {
                                     let mut queue = cursor_data.lock().unwrap();
                                     queue.push(shape);
@@ -636,6 +911,146 @@ impl VncDisplay {
                                     let incremental = first_frame_received;
                                     let _ = client.request_update(incremental, 0, 0, w, h);
                                 }
+                                #[cfg(not(target_os = "android"))]
+                                VncEvent::MediaStreamAnswer(answer) => {
+                                    log::info!(
+                                        "Apple HP media stream answer: {}x{}, tiles={}, codec={:?}",
+                                        answer.canvas_width,
+                                        answer.canvas_height,
+                                        answer.tile_count,
+                                        answer.codec
+                                    );
+                                    media_answer = Some(answer);
+                                }
+                                #[cfg(not(target_os = "android"))]
+                                VncEvent::MediaStreamInit(init) => {
+                                    // Stage-2 announcements arrive roughly once
+                                    // per second; keep them out of the info log.
+                                    if init.stage == 2 {
+                                        log::trace!(
+                                            "Apple HP media stream init: stage=2 (keepalive)"
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "Apple HP media stream init: stage={} base_udp_port={}",
+                                            init.stage,
+                                            init.base_udp_port
+                                        );
+                                    }
+                                    // Stage-2 announcements (port=0) are
+                                    // keepalives/confirmations and must not tear
+                                    // down already-bound sockets.
+                                    if init.base_udp_port == 0 {
+                                        continue;
+                                    }
+                                    if let Some(keys) = media_keys.as_ref() {
+                                        let (fb_w, fb_h) = client.dimensions();
+                                        let width = media_answer
+                                            .map(|a| a.canvas_width as u16)
+                                            .filter(|&v| v != 0)
+                                            .unwrap_or(fb_w);
+                                        let height = media_answer
+                                            .map(|a| a.canvas_height as u16)
+                                            .filter(|&v| v != 0)
+                                            .unwrap_or(fb_h);
+                                        if width == 0 || height == 0 {
+                                            log::warn!(
+                                                "Media stream has zero canvas dimensions, not starting"
+                                            );
+                                            continue;
+                                        }
+                                        let codec =
+                                            media_answer.map(|a| a.codec).unwrap_or(Codec::Hevc);
+
+                                        if init.base_udp_port != bound_base_port {
+                                            // Server wants a different UDP port;
+                                            // restart the receiver on the new one.
+                                            client.stop_media_stream();
+                                            match client.start_media_stream(
+                                                keys.clone(),
+                                                init,
+                                                width,
+                                                height,
+                                                codec,
+                                            ) {
+                                                Ok(()) => {
+                                                    log::info!(
+                                                        "Apple HP media stream restarted on port {}",
+                                                        init.base_udp_port
+                                                    );
+                                                    bound_base_port = init.base_udp_port;
+                                                    media_stream_started = true;
+                                                }
+                                                Err(e) => {
+                                                    let msg = format!(
+                                                        "Failed to restart media stream: {}",
+                                                        e
+                                                    );
+                                                    log::error!("{}", msg);
+                                                    error_queue.lock().unwrap().push(msg);
+                                                }
+                                            }
+                                        } else if media_stream_started {
+                                            log::debug!(
+                                                "Apple HP media stream already bound on port {}",
+                                                bound_base_port
+                                            );
+                                        } else {
+                                            match client.start_media_stream(
+                                                keys.clone(),
+                                                init,
+                                                width,
+                                                height,
+                                                codec,
+                                            ) {
+                                                Ok(()) => {
+                                                    log::info!(
+                                                        "Apple HP media stream started: {}x{} on port {}",
+                                                        width, height, init.base_udp_port
+                                                    );
+                                                    bound_base_port = init.base_udp_port;
+                                                    media_stream_started = true;
+                                                }
+                                                Err(e) => {
+                                                    let msg = format!(
+                                                        "Failed to start media stream: {}",
+                                                        e
+                                                    );
+                                                    log::error!("{}", msg);
+                                                    error_queue.lock().unwrap().push(msg);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "MediaStreamInit received but no keys available"
+                                        );
+                                    }
+                                }
+                                #[cfg(not(target_os = "android"))]
+                                VncEvent::MediaFrame {
+                                    width,
+                                    height,
+                                    rgba,
+                                } => {
+                                    log::trace!(
+                                        "Apple HP media frame: {}x{} ({} bytes)",
+                                        width,
+                                        height,
+                                        rgba.len()
+                                    );
+                                    let mut queue = frame_data.lock().unwrap();
+                                    queue.clear();
+                                    queue.push(FrameData {
+                                        width: width as i32,
+                                        height: height as i32,
+                                        pixels: rgba,
+                                    });
+                                    // Do not set `updated`: the TCP framebuffer
+                                    // did not change, and the post-batch block
+                                    // would otherwise overwrite this media frame
+                                    // with a stale TCP framebuffer snapshot.
+                                }
                                 _ => {}
                             }
                         }
@@ -643,13 +1058,15 @@ impl VncDisplay {
                         // If the server is not pushing frames continuously, request
                         // the next update exactly once per message batch. Use
                         // incremental updates once the first full frame has been
-                        // received; otherwise request a full refresh.
-                        if updated {
+                        // received; otherwise request a full refresh. In Apple HP
+                        // media mode the 1x1 poll above handles re-arming and the
+                        // TCP framebuffer carries no video, so skip this entirely.
+                        if updated && !hp_media {
                             let (w, h) = client.dimensions();
                             let _ = client.request_update(first_frame_received, 0, 0, w, h);
                         }
 
-                        if updated || resized {
+                        if (updated && !hp_media) || resized {
                             let fb = client.framebuffer();
                             let data = FrameData {
                                 width: fb.width() as i32,
@@ -676,6 +1093,13 @@ impl VncDisplay {
                         break;
                     }
                 }
+
+                // Note: no blind 0x1c re-offers here. A re-offer makes the
+                // daemon restart the encoder on a fresh SSRC group, which
+                // costs seconds of re-negotiation each time. The initial
+                // offer (handshake) plus the 0x451-driven re-offer cover the
+                // daemon's requirements; "packets flow but nothing decodes"
+                // is handled by FIR and the decoder watchdog, not re-offers.
 
                 // Sample connection stats once per second.
                 if last_stats_sample.elapsed() >= Duration::from_secs(1) {

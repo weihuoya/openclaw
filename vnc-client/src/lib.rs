@@ -60,7 +60,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::tls::TlsStream;
@@ -68,8 +68,11 @@ use crate::tls::TlsStream;
 pub mod apple;
 pub mod apple_dh;
 pub mod apple_media;
+pub mod apple_media_stream;
 pub mod apple_record_layer;
 pub mod apple_srp;
+#[cfg(not(target_os = "android"))]
+pub use apple_media_stream::MediaStreamEvent;
 pub mod auth;
 pub mod clipboard;
 pub mod cursor;
@@ -93,7 +96,7 @@ pub mod zrle;
 use apple_media::{MediaStreamAnswer, MediaStreamInit, MediaStreamKeys};
 use auth::AuthHandler;
 use cursor::CursorShape;
-use decoder::DefaultDecoder;
+use decoder::{Codec, DefaultDecoder, VideoDecoder};
 use encodings::{from_i32, Encoding};
 use flate2::read::ZlibDecoder;
 use framebuffer::Framebuffer;
@@ -172,6 +175,16 @@ impl Write for VncStreamInner {
             VncStreamInner::AppleHp(s) => s.flush(),
         }
     }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            VncStreamInner::Plain(s) => s.write_all(buf),
+            VncStreamInner::Tls(s) => s.write_all(buf),
+            VncStreamInner::Aes(s) => s.write_all(buf),
+            VncStreamInner::Ws(s) => s.write_all(buf),
+            VncStreamInner::AppleHp(s) => s.write_all(buf),
+        }
+    }
 }
 
 /// A stream that can be plain TCP, TLS-wrapped, AES-encrypted, or WebSocket.
@@ -196,6 +209,17 @@ impl VncStream {
 
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+
+    /// Return the peer address of the underlying transport, if available.
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        match &self.inner {
+            VncStreamInner::Plain(s) => s.peer_addr(),
+            VncStreamInner::Tls(s) => s.get_ref().peer_addr(),
+            VncStreamInner::Aes(s) => s.peer_addr(),
+            VncStreamInner::Ws(s) => s.peer_addr(),
+            VncStreamInner::AppleHp(s) => s.peer_addr(),
+        }
     }
 
     /// Rekey the Apple high-performance record layer, if active.
@@ -244,6 +268,16 @@ impl VncStream {
             )),
         }
     }
+
+    /// Read the remainder of the current Apple HP record.
+    pub fn read_remaining_record(&mut self) -> Result<Vec<u8>, VncError> {
+        match &mut self.inner {
+            VncStreamInner::AppleHp(layer) => layer.read_remaining_record().map_err(VncError::Io),
+            _ => Err(VncError::Protocol(
+                "read_remaining_record only available for Apple HP record layer".to_string(),
+            )),
+        }
+    }
 }
 
 impl Read for VncStream {
@@ -263,6 +297,17 @@ impl Write for VncStream {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        // Delegate to the inner stream's write_all so that buffered transports
+        // (notably the Apple HP record layer) flush their records. The default
+        // std::io::Write::write_all only calls write() and never flushes, which
+        // caused Apple HP messages such as the 0x1c media-stream offer to be stuck
+        // in the record layer's internal buffer.
+        self.inner.write_all(buf)?;
+        self.bytes_written += buf.len() as u64;
+        Ok(())
     }
 }
 
@@ -349,12 +394,22 @@ pub struct VncClient {
     /// Whether to enable the Apple HP adaptive media stream path and advertise
     /// the media-init encodings (`0x3ea`, `0x3f2`, `0x3f3`).
     apple_media_stream_h264: bool,
+    /// SRTP master keys generated for the Apple HP adaptive media stream.
+    /// Set during handshake when `apple_media_stream_h264` is true.
+    apple_media_stream_keys: Option<MediaStreamKeys>,
     /// Apple HP encoding list used during the plaintext and encrypted SetEncodings
     /// handshake. Varies depending on whether the media stream path is enabled.
     apple_hp_encodings: Vec<i32>,
     /// Apple cursor cache keyed by `cache_id`. STOREd cursors are kept here;
     /// SELECT rectangles reference a cached id and emit a `CursorShape` event.
     apple_cursor_cache: HashMap<u32, AppleCursor>,
+    /// Scaled (logical-point) geometry from the latest Apple display layout
+    /// (`0x451`). Pointer input must be mapped into this space, not the
+    /// backing-pixel space used for the framebuffer.
+    apple_scaled_size: Option<(u16, u16)>,
+    #[cfg(not(target_os = "android"))]
+    /// Optional Apple HP HEVC media stream receiver running on a background thread.
+    media_stream: Option<apple_media_stream::AppleMediaStream>,
 }
 
 /// A cached Apple HP cursor image (encoding [`protocol::apple::ENC_CURSOR`]).
@@ -441,9 +496,19 @@ pub enum VncEvent {
     MediaStreamAnswer(MediaStreamAnswer),
     /// Apple HP media stream init announcement (`0x3f2` stage 1 / stage 2).
     ///
-    /// Provides the UDP base port hint and stream count; the actual RTP/SRTP
-    /// media channel setup is left to the application.
+    /// Provides the UDP base port hint and stream count. The caller can start the
+    /// HEVC receiver with [`VncClient::start_media_stream`].
     MediaStreamInit(MediaStreamInit),
+    /// Decoded HEVC frame from the Apple HP adaptive media stream.
+    ///
+    /// Emitted once [`VncClient::start_media_stream`] has started the UDP
+    /// receiver and the decoder has produced a frame. The RGBA buffer has
+    /// dimensions `width x height`.
+    MediaFrame {
+        width: u16,
+        height: u16,
+        rgba: Vec<u8>,
+    },
     /// Audio data received (QEMU extension).
     Audio {
         sample_rate: u32,
@@ -515,8 +580,12 @@ impl VncClient {
             apple_hidpi_scale: 2.0,
             apple_virtual_display: true,
             apple_media_stream_h264: false,
+            apple_media_stream_keys: None,
             apple_hp_encodings: apple_record_layer::APPLE_HP_ENCODINGS.to_vec(),
             apple_cursor_cache: HashMap::new(),
+            apple_scaled_size: None,
+            #[cfg(not(target_os = "android"))]
+            media_stream: None,
         }
     }
 
@@ -1038,23 +1107,22 @@ impl VncClient {
                 bytes_written,
             });
 
-            // Encrypted preface: send SetEncodings, a full update request, and
-            // AutoFrameBufferUpdate to arm the server sender.
+            // Encrypted preface. Send SetEncodings first, then the 0x1c media
+            // stream offer immediately after it, then a FramebufferUpdateRequest.
+            // Native Screen Sharing.app and the reference iShareScreen client both
+            // place the 0x1c offer before any AutoFrameBufferUpdate / free-run
+            // request; sending 0x09 first arms the TCP framebuffer sender and
+            // prevents the daemon from starting the UDP media path.
             log::debug!("Apple HP: sending encrypted SetEncodings");
             self.set_encodings(&self.encodings.clone())?;
+
+            if self.apple_media_stream_h264 {
+                log::debug!("Apple HP: sending encrypted MediaStreamOptions (0x1c)");
+                let _ = self.send_hp_media_stream_options(true)?;
+            }
+
             log::debug!("Apple HP: sending encrypted FramebufferUpdateRequest");
             self.request_update(false, 0, 0, self.width, self.height)?;
-            log::debug!("Apple HP: sending encrypted AutoFrameBufferUpdate");
-            self.stream
-                .as_mut()
-                .ok_or(VncError::NotConnected)?
-                .write_all(&apple_record_layer::build_auto_framebuffer_update(
-                    protocol::apple::SELECTED_SCREEN_ALL,
-                    0,
-                    0,
-                    self.width,
-                    self.height,
-                ))?;
         }
 
         self.state = ClientState::Initialization;
@@ -1253,6 +1321,14 @@ impl VncClient {
         Ok(())
     }
 
+    /// Scaled (logical-point) geometry from the latest Apple display layout
+    /// (`0x451`), if one has been received. In HP mode pointer coordinates
+    /// must be sent in this space, while the framebuffer uses the larger
+    /// backing-pixel geometry.
+    pub fn apple_scaled_size(&self) -> Option<(u16, u16)> {
+        self.apple_scaled_size
+    }
+
     /// Send a key event (key press or release).
     ///
     /// `keysym` is an X11 keysym value. Common values:
@@ -1379,6 +1455,31 @@ impl VncClient {
         Ok(())
     }
 
+    /// Send an Apple HP `AutoFrameBufferUpdate` (0x09) message.
+    ///
+    /// This arms the daemon's framebuffer sender so it freely emits cursor
+    /// pseudo-encoding updates and other TCP-side rectangles. The native client
+    /// sends this together with a non-incremental `FramebufferUpdateRequest`
+    /// at startup and after every display-layout transition.
+    pub fn send_hp_auto_framebuffer_update(
+        &mut self,
+        selected_screen: u32,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        stream.write_all(&apple_record_layer::build_auto_framebuffer_update(
+            selected_screen,
+            x,
+            y,
+            width,
+            height,
+        ))?;
+        Ok(())
+    }
+
     /// Request a remote pasteboard fetch after a `ClipboardChanged` event (Apple HP).
     ///
     /// Sends a `ClipboardFetch` (0x0b) message; the server replies with the current
@@ -1389,13 +1490,21 @@ impl VncClient {
         Ok(())
     }
 
+    /// Return the SRTP master keys most recently generated for the Apple HP
+    /// adaptive media stream, if any.
+    ///
+    /// Keys are created when the 0x1c offer is sent (either automatically during
+    /// handshake or manually via [`Self::send_hp_media_stream_options`]).
+    pub fn apple_media_stream_keys(&self) -> Option<&MediaStreamKeys> {
+        self.apple_media_stream_keys.as_ref()
+    }
+
     /// Send an Apple HP `MediaStreamOptions` (0x1c) offer to negotiate the adaptive
     /// media path.
     ///
     /// Only available when Apple high-performance mode is active. The offer
-    /// requests a single H.264 video stream (one tile per frame, decodable by any
-    /// standard H.264 decoder) and an audio stream. The audio stream can be
-    /// suppressed with `audio_enabled = false`.
+    /// requests a single HEVC video stream (one tile per frame) and an audio
+    /// stream. The audio stream can be suppressed with `audio_enabled = false`.
     ///
     /// Returns the generated SRTP master keys; the caller should keep them for the
     /// application-level media channel. The server reply is read with
@@ -1405,16 +1514,38 @@ impl VncClient {
         &mut self,
         audio_enabled: bool,
     ) -> Result<MediaStreamKeys, VncError> {
+        let keys = MediaStreamKeys::random();
+        self.send_hp_media_stream_options_with_keys(keys.clone(), audio_enabled)?;
+        Ok(keys)
+    }
+
+    /// Send an Apple HP `MediaStreamOptions` (0x1c) offer using caller-supplied
+    /// SRTP master keys.
+    ///
+    /// This allows the caller to bind the UDP media sockets and generate the
+    /// SRTP keys *before* sending the first offer, and then re-send the same
+    /// offer (with the same keys) while waiting for the encoder to become ready.
+    /// Apple rejects offers whose keys do not match the sockets it has already
+    /// seen, so reusing keys is required for reliable negotiation.
+    pub fn send_hp_media_stream_options_with_keys(
+        &mut self,
+        keys: MediaStreamKeys,
+        audio_enabled: bool,
+    ) -> Result<(), VncError> {
         if !self.high_performance {
             return Err(VncError::Protocol(
                 "Apple HP media stream requires high-performance mode".to_string(),
             ));
         }
-        let keys = MediaStreamKeys::random();
-        let msg = apple_media::build_media_stream_options(&keys, audio_enabled, true);
+        let msg = apple_media::build_media_stream_options(&keys, audio_enabled);
+        log::debug!(
+            "Apple HP: sending MediaStreamOptions offer ({} bytes)",
+            msg.len()
+        );
         let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
         stream.write_all(&msg)?;
-        Ok(keys)
+        self.apple_media_stream_keys = Some(keys);
+        Ok(())
     }
 
     /// Read a server-side `0x1c` media-stream answer from the record layer.
@@ -1434,6 +1565,101 @@ impl VncClient {
         apple_media::parse_media_stream_answer(&buf).ok_or_else(|| {
             VncError::Protocol("Failed to parse Apple HP media stream answer".to_string())
         })
+    }
+
+    /// Start the Apple HP adaptive media stream receiver (H.264 or HEVC).
+    ///
+    /// This binds a local UDP socket, sends a firewall-punch packet to the
+    /// server, starts the background RTP/SRTP receiver thread, and feeds decoded
+    /// frames into the event channel. Decoded frames are surfaced through
+    /// [`VncEvent::MediaFrame`] by [`Self::read_messages`].
+    ///
+    /// `canvas_width` and `canvas_height` are the negotiated video dimensions from
+    /// the [`MediaStreamAnswer`] returned by the `0x1c` exchange. `codec` selects
+    /// the video decoder (H.264 or HEVC).
+    ///
+    /// This is only available on non-Android targets and requires the session
+    /// to be in Apple high-performance mode.
+    #[cfg(not(target_os = "android"))]
+    pub fn start_media_stream(
+        &mut self,
+        keys: MediaStreamKeys,
+        init: MediaStreamInit,
+        canvas_width: u16,
+        canvas_height: u16,
+        codec: Codec,
+    ) -> Result<(), VncError> {
+        if !self.high_performance {
+            return Err(VncError::Protocol(
+                "Apple HP media stream requires high-performance mode".to_string(),
+            ));
+        }
+        let server_addr = self
+            .stream
+            .as_ref()
+            .ok_or(VncError::NotConnected)?
+            .peer_addr()
+            .map_err(VncError::Io)?;
+        let decoder = DefaultDecoder::for_codec(codec)?;
+        decoder.set_size(canvas_width, canvas_height);
+        let stream = apple_media_stream::AppleMediaStream::start(
+            &keys,
+            init,
+            server_addr,
+            canvas_width,
+            canvas_height,
+            codec,
+            Box::new(decoder),
+        )?;
+        self.media_stream = Some(stream);
+        Ok(())
+    }
+
+    /// Stop the Apple HP media stream receiver, if it is running.
+    #[cfg(not(target_os = "android"))]
+    pub fn stop_media_stream(&mut self) {
+        self.media_stream = None;
+    }
+
+    /// Ask the media stream receiver to request a fresh IDR (FIR/PLI) from the
+    /// server and forget previously seen parameter sets.
+    ///
+    /// Call this after re-sending the `0x1c` offer in response to an Apple
+    /// display-layout change (`0x451`): the encoder restarts its burst and
+    /// waits for an explicit keyframe request before sending decodable frames.
+    /// No-op when no media stream is running.
+    #[cfg(not(target_os = "android"))]
+    pub fn request_media_keyframe(&self) {
+        if let Some(stream) = self.media_stream.as_ref() {
+            stream.request_keyframe();
+        }
+    }
+
+    /// Number of Apple HP media video RTP packets received so far (0 when no
+    /// media stream is running). Useful to tell "server never started
+    /// streaming" (re-offer the 0x1c) from "streaming but not decoding"
+    /// (request a keyframe instead).
+    #[cfg(not(target_os = "android"))]
+    pub fn media_video_packets(&self) -> u64 {
+        self.media_stream
+            .as_ref()
+            .map(|s| s.video_packets())
+            .unwrap_or(0)
+    }
+
+    /// Resize the running Apple HP media stream decoder.
+    ///
+    /// The negotiated canvas dimensions are not known until the server sends a
+    /// non-degenerate `0x1c` answer. Call this method after receiving
+    /// [`VncEvent::MediaStreamAnswer`] to update the decoder size accordingly.
+    #[cfg(not(target_os = "android"))]
+    pub fn set_media_stream_size(&mut self, width: u16, height: u16) -> Result<(), VncError> {
+        if let Some(stream) = self.media_stream.as_ref() {
+            stream.resize(width, height);
+            Ok(())
+        } else {
+            Err(VncError::Protocol("No active media stream".to_string()))
+        }
     }
 
     /// Enable continuous updates (server pushes frames without client requests).
@@ -1550,6 +1776,30 @@ impl VncClient {
 
         let mut events = Vec::new();
 
+        // Drain any decoded frames produced by the Apple HP media stream receiver
+        // before blocking on the TCP control channel.
+        #[cfg(not(target_os = "android"))]
+        if let Some(stream) = self.media_stream.as_ref() {
+            while let Some(event) = stream.try_recv() {
+                match event {
+                    apple_media_stream::MediaStreamEvent::Frame {
+                        width,
+                        height,
+                        rgba,
+                    } => {
+                        events.push(VncEvent::MediaFrame {
+                            width,
+                            height,
+                            rgba,
+                        });
+                    }
+                    apple_media_stream::MediaStreamEvent::Error(msg) => {
+                        log::warn!("Apple media stream error: {}", msg);
+                    }
+                }
+            }
+        }
+
         // Use a short timeout while waiting for the next message type so the
         // caller can periodically check for input events and heartbeats.
         let saved_timeout = self.read_timeout;
@@ -1562,6 +1812,8 @@ impl VncClient {
             .ok_or(VncError::NotConnected)?
             .read_exact(&mut msg_type);
 
+        log::trace!("read_messages msg_type=0x{:02x}", msg_type[0]);
+
         if let Err(e) = msg_type_result {
             let _ = self.set_read_timeout(saved_timeout);
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -1570,6 +1822,12 @@ impl VncClient {
             if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut
             {
+                // Do not drop events that were already drained this call (e.g.
+                // decoded Apple HP media frames) just because no TCP message
+                // arrived within the timeout window.
+                if !events.is_empty() {
+                    return Ok(events);
+                }
                 return Err(VncError::Timeout);
             }
             return Err(e.into());
@@ -1623,6 +1881,10 @@ impl VncClient {
                 log::debug!("Server message: QEMU extension");
                 self.last_msg_type = Some(protocol::qemu::MESSAGE_TYPE);
                 self.handle_qemu_extension(&mut events)
+            }
+            protocol::apple::MEDIA_STREAM_OPTIONS => {
+                self.last_msg_type = Some(protocol::apple::MEDIA_STREAM_OPTIONS);
+                self.handle_apple_media_stream_options(&mut events)
             }
             protocol::apple::MISC_STATUS => {
                 self.last_msg_type = Some(protocol::apple::MISC_STATUS);
@@ -1679,6 +1941,7 @@ impl VncClient {
                 );
                 self.last_encoding = Some(encoding);
                 self.recent_encodings.push(encoding);
+                log::trace!("FramebufferUpdate rect x={x} y={y} w={width} h={height} encoding={encoding:#x}");
                 (x, y, width, height, encoding)
             };
 
@@ -1748,13 +2011,24 @@ impl VncClient {
                     continue;
                 }
                 Encoding::AppleHp(enc) if enc == protocol::apple::ENC_VENDOR_KEYSYMS => {
-                    // Apple vendor keysyms (fixed 22-byte payload).
+                    // Apple vendor keysyms (u16 payload_len + opaque payload).
                     let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
-                    let mut payload = vec![0u8; 22];
+                    let mut len_buf = [0u8; 2];
+                    stream.read_exact(&mut len_buf)?;
+                    let payload_len = u16::from_be_bytes(len_buf) as usize;
+                    const MAX_VENDOR_KEYSYM_LEN: usize = 64 * 1024;
+                    if payload_len > MAX_VENDOR_KEYSYM_LEN {
+                        return Err(VncError::Protocol(format!(
+                            "Apple vendor keysyms payload length {} exceeds limit",
+                            payload_len
+                        )));
+                    }
+                    let mut payload = vec![0u8; payload_len];
                     stream.read_exact(&mut payload)?;
                     log::debug!(
-                        "Apple vendor keysyms (encoding {:#x}) ignored",
-                        protocol::apple::ENC_VENDOR_KEYSYMS
+                        "Apple vendor keysyms (encoding {:#x}) ignored ({} bytes)",
+                        protocol::apple::ENC_VENDOR_KEYSYMS,
+                        payload_len
                     );
                     continue;
                 }
@@ -1774,18 +2048,62 @@ impl VncClient {
                     let payload_len = u16::from_be_bytes(len_buf) as usize;
                     let mut payload = vec![0u8; payload_len];
                     stream.read_exact(&mut payload)?;
-                    if let Some(init) = apple_media::parse_media_stream_init(&payload) {
-                        log::debug!(
+                    // parse_media_stream_init expects the length-prefixed form.
+                    let mut prefixed = Vec::with_capacity(2 + payload_len);
+                    prefixed.extend_from_slice(&len_buf);
+                    prefixed.extend_from_slice(&payload);
+                    if let Some(init) = apple_media::parse_media_stream_init(&prefixed) {
+                        log::trace!(
                             "Apple media stream init stage={} port={}",
                             init.stage,
                             init.base_udp_port
                         );
                         events.push(VncEvent::MediaStreamInit(init));
+                    } else if let Some(answer) = apple_media::parse_media_stream_answer(&prefixed) {
+                        log::debug!(
+                            "Apple media stream answer (encoding {:#x}): {}x{} tiles={} codec={:?}",
+                            protocol::apple::ENC_MEDIA_STREAM,
+                            answer.canvas_width,
+                            answer.canvas_height,
+                            answer.tile_count,
+                            answer.codec
+                        );
+                        events.push(VncEvent::MediaStreamAnswer(answer));
                     } else {
                         log::debug!(
                             "Apple media stream announcement (encoding {:#x}) malformed",
                             protocol::apple::ENC_MEDIA_STREAM
                         );
+                    }
+                    continue;
+                }
+                Encoding::AppleHp(enc) if enc == protocol::apple::MEDIA_STREAM_OPTIONS as i32 => {
+                    log::warn!("Apple media stream options answer rect (encoding 0x1c)");
+                    // The 0x1c answer is a single rect inside a FramebufferUpdate.
+                    // Its body is a zlib-compressed binary plist; read the rest of
+                    // the current record, decompress, and parse it.
+                    let body = {
+                        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+                        stream.read_remaining_record()?
+                    };
+                    log::warn!(
+                        "0x1c answer body {} bytes prefix={:02x?}",
+                        body.len(),
+                        &body[..body.len().min(16)]
+                    );
+                    let decompressed =
+                        apple_media::zlib_decompress(&body).unwrap_or_else(|| body.clone());
+                    if let Some(parsed) = apple_media::parse_media_stream_answer(&decompressed) {
+                        log::warn!(
+                            "0x1c answer parsed: {}x{} tiles={} codec={:?}",
+                            parsed.canvas_width,
+                            parsed.canvas_height,
+                            parsed.tile_count,
+                            parsed.codec
+                        );
+                        events.push(VncEvent::MediaStreamAnswer(parsed));
+                    } else {
+                        log::warn!("0x1c answer could not be parsed");
                     }
                     continue;
                 }
@@ -1829,7 +2147,10 @@ impl VncClient {
                     let payload_len = u16::from_be_bytes(len_buf) as usize;
                     let mut payload = vec![0u8; payload_len];
                     stream.read_exact(&mut payload)?;
-                    if let Some(init) = apple_media::parse_media_stream_init(&payload) {
+                    let mut prefixed = Vec::with_capacity(2 + payload_len);
+                    prefixed.extend_from_slice(&len_buf);
+                    prefixed.extend_from_slice(&payload);
+                    if let Some(init) = apple_media::parse_media_stream_init(&prefixed) {
                         log::debug!(
                             "Apple media reconfig {:#x} stage={} port={}",
                             enc,
@@ -1837,6 +2158,16 @@ impl VncClient {
                             init.base_udp_port
                         );
                         events.push(VncEvent::MediaStreamInit(init));
+                    } else if let Some(answer) = apple_media::parse_media_stream_answer(&prefixed) {
+                        log::debug!(
+                            "Apple media stream answer (encoding {:#x}): {}x{} tiles={} codec={:?}",
+                            enc,
+                            answer.canvas_width,
+                            answer.canvas_height,
+                            answer.tile_count,
+                            answer.codec
+                        );
+                        events.push(VncEvent::MediaStreamAnswer(answer));
                     } else {
                         log::debug!("Apple media reconfig (encoding {:#x}) malformed", enc);
                     }
@@ -2418,6 +2749,10 @@ impl VncClient {
             screens.len()
         );
 
+        if scaled_width > 0 && scaled_height > 0 {
+            self.apple_scaled_size = Some((scaled_width, scaled_height));
+        }
+
         // Use the backing geometry for the local framebuffer, which is where
         // decoded rectangles are written. The scaled size is for window sizing.
         if backing_width > 0 && backing_height > 0 {
@@ -2497,12 +2832,15 @@ impl VncClient {
         let mut msg_size_buf = [0u8; 2];
         stream.read_exact(&mut msg_size_buf)?;
         let msg_size = u16::from_be_bytes(msg_size_buf) as usize;
-        if msg_size < 2 {
+        if msg_size < 16 {
             return Err(VncError::Protocol(
                 "Apple device info message size too small".to_string(),
             ));
         }
-        let mut payload = vec![0u8; msg_size - 2];
+        // `message_size` covers the fixed 16-byte header and the trailing
+        // info block (strings + housing_color), not the 2-byte `message_size`
+        // field itself. Read exactly that many bytes.
+        let mut payload = vec![0u8; msg_size];
         stream.read_exact(&mut payload)?;
 
         let Some(info) = parse_apple_device_info(&payload) else {
@@ -2524,6 +2862,53 @@ impl VncClient {
             enclosure_rgb_color: info.enclosure_rgb_color,
             housing_color: info.housing_color,
         });
+        Ok(())
+    }
+
+    /// Handle a server-side `0x1c` MediaStreamOptions answer.
+    fn handle_apple_media_stream_options(
+        &mut self,
+        events: &mut Vec<VncEvent>,
+    ) -> Result<(), VncError> {
+        let stream = self.stream.as_mut().ok_or(VncError::NotConnected)?;
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header)?;
+        let message_size = u16::from_be_bytes([header[2], header[3]]) as usize;
+        const MAX_MEDIA_OPTIONS_LEN: usize = 64 * 1024;
+        if message_size > MAX_MEDIA_OPTIONS_LEN {
+            return Err(VncError::Protocol(format!(
+                "Apple media stream options answer message size {} exceeds limit",
+                message_size
+            )));
+        }
+        let mut body = vec![0u8; message_size];
+        stream.read_exact(&mut body)?;
+        let mut answer = Vec::with_capacity(4 + message_size);
+        answer.extend_from_slice(&header);
+        answer.extend_from_slice(&body);
+        if let Some(parsed) = apple_media::parse_media_stream_answer(&answer) {
+            log::debug!(
+                "Apple media stream answer: {}x{} tiles={} codec={:?}",
+                parsed.canvas_width,
+                parsed.canvas_height,
+                parsed.tile_count,
+                parsed.codec
+            );
+            events.push(VncEvent::MediaStreamAnswer(parsed));
+        } else {
+            log::debug!(
+                "Apple media stream answer degenerate or malformed ({} bytes)",
+                answer.len()
+            );
+            // The offer only advertises HEVC, so a degenerate answer still
+            // implies the HEVC path.
+            events.push(VncEvent::MediaStreamAnswer(MediaStreamAnswer {
+                canvas_width: 0,
+                canvas_height: 0,
+                tile_count: 0,
+                codec: Codec::Hevc,
+            }));
+        }
         Ok(())
     }
 
@@ -3034,16 +3419,17 @@ impl VncClientBuilder {
         self
     }
 
-    /// Enable the Apple HP adaptive media stream path and request H.264.
+    /// Enable the Apple HP adaptive media stream path and request HEVC.
     ///
     /// The Apple HP encoding list already advertises the media-path values
     /// (`0x3ea` = 1002, `0x3f2` = 1010, `0x3f3` = 1011), so this flag does not
     /// change the advertised encodings. It enables the `0x1c` MediaStreamOptions
-    /// offer API (`send_hp_media_stream_options`) and the parser for media-init
-    /// rectangles (`VncEvent::MediaStreamInit`).
+    /// offer API (`send_hp_media_stream_options`), the parser for media-init
+    /// rectangles (`VncEvent::MediaStreamInit`), and the HEVC UDP/SRTP media
+    /// stream receiver (`VncClient::start_media_stream`,
+    /// `VncEvent::MediaFrame`).
     ///
-    /// The actual UDP/SRTP media channel is not implemented here; this is only
-    /// the negotiation plumbing.
+    /// The receiver is only available on non-Android targets.
     ///
     /// Has no effect unless [`Self::high_performance`] is also enabled.
     pub fn apple_media_stream_h264(mut self, enable: bool) -> Self {
@@ -3359,6 +3745,74 @@ mod tests {
     }
 
     #[test]
+    fn handle_apple_media_stream_init_yields_event() {
+        use protocol::apple;
+        let (mut client, mut server) = fence_test_client();
+
+        // One FBUpdate rectangle with encoding 0x3f2 and a stage-1 payload.
+        // The 0x3f2 body has a u16 length prefix and a 14-byte fixed header;
+        // there is no leading padding before the version/type pair.
+        let mut init_payload = Vec::new();
+        init_payload.extend_from_slice(&1u16.to_be_bytes()); // version = 1
+        init_payload.extend_from_slice(&1u16.to_be_bytes()); // type = 1 (stage 1)
+        init_payload.extend_from_slice(&0u16.to_be_bytes()); // field6 = next stream port
+        init_payload.extend_from_slice(&1u16.to_be_bytes()); // field8 = stream_count
+        init_payload.extend_from_slice(&5900u16.to_be_bytes()); // field10 = base UDP port
+        init_payload.extend_from_slice(&0u32.to_be_bytes()); // field12
+
+        server.write_all(&[0, 0, 1]).unwrap(); // padding + num_rects = 1
+        let header = protocol::framing::RectHeader {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            encoding: apple::ENC_MEDIA_STREAM,
+        };
+        server.write_all(&header.to_bytes()).unwrap();
+        server
+            .write_all(&(init_payload.len() as u16).to_be_bytes())
+            .unwrap();
+        server.write_all(&init_payload).unwrap();
+
+        let mut events = Vec::new();
+        client.handle_framebuffer_update(&mut events).unwrap();
+        assert_eq!(events.len(), 1);
+        match events.remove(0) {
+            VncEvent::MediaStreamInit(init) => {
+                assert_eq!(init.stage, 1);
+                assert_eq!(init.base_udp_port, 5900);
+                assert_eq!(init.stream_count, 1);
+            }
+            _ => panic!("expected MediaStreamInit event"),
+        }
+    }
+
+    #[test]
+    fn handle_apple_media_stream_options_yields_answer_event() {
+        let (mut client, mut server) = fence_test_client();
+
+        // Build a degenerate answer (empty body) — still valid 0x1c framing.
+        server
+            .write_all(&[protocol::apple::MEDIA_STREAM_OPTIONS, 0])
+            .unwrap();
+        server.write_all(&0u16.to_be_bytes()).unwrap(); // message_size = 0
+
+        let mut events = Vec::new();
+        client
+            .handle_apple_media_stream_options(&mut events)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        match events.remove(0) {
+            VncEvent::MediaStreamAnswer(answer) => {
+                assert_eq!(answer.canvas_width, 0);
+                assert_eq!(answer.canvas_height, 0);
+                assert_eq!(answer.tile_count, 0);
+            }
+            _ => panic!("expected MediaStreamAnswer event"),
+        }
+    }
+
+    #[test]
     fn parse_apple_display_layout_extracts_screens() {
         // Build a payload for a single 1920×1080 display.
         let mut payload = Vec::new();
@@ -3458,8 +3912,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_apple_device_info_rejects_short_payload() {
-        assert!(parse_apple_device_info(&[0u8; 10]).is_none());
+    fn handle_apple_device_info_reads_message_size_prefix() {
+        let (mut client, mut server) = fence_test_client();
+        let identifier = "MacBookPro18,1";
+        let color = "Silver";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_be_bytes()); // block_pair_count
+        payload.extend_from_slice(&1u32.to_be_bytes()); // structure_version
+        payload.extend_from_slice(&0u32.to_be_bytes()); // enclosure_rgb_color
+        payload.extend_from_slice(&((identifier.len() + 1) as u16).to_be_bytes()); // device_identifier_len
+        payload.extend_from_slice(&((color.len() + 1) as u16).to_be_bytes()); // device_color_len
+        payload.extend_from_slice(&((color.len() + 1) as u16).to_be_bytes()); // enclosure_color_len
+        payload.extend_from_slice(identifier.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(color.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(color.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&7i32.to_be_bytes()); // housing_color
+
+        server
+            .write_all(&(payload.len() as u16).to_be_bytes())
+            .unwrap();
+        server.write_all(&payload).unwrap();
+
+        let mut events = Vec::new();
+        client.handle_apple_device_info(&mut events).unwrap();
+        assert_eq!(events.len(), 1);
+        match events.remove(0) {
+            VncEvent::DeviceInfo {
+                device_identifier,
+                housing_color,
+                ..
+            } => {
+                assert_eq!(device_identifier, identifier);
+                assert_eq!(housing_color, 7);
+            }
+            _ => panic!("expected DeviceInfo event"),
+        }
+    }
+
+    #[test]
+    fn handle_apple_device_info_rejects_short_message_size() {
+        let (mut client, mut server) = fence_test_client();
+        server.write_all(&2u16.to_be_bytes()).unwrap(); // message_size = 2 (too small)
+        server.write_all(&[0u8; 2]).unwrap();
+
+        let mut events = Vec::new();
+        assert!(matches!(
+            client.handle_apple_device_info(&mut events),
+            Err(VncError::Protocol(_))
+        ));
     }
 
     #[test]

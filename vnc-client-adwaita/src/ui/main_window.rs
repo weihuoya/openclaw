@@ -13,7 +13,7 @@ use crate::settings::load_settings;
 use crate::stats::format_stats;
 use crate::ui::connect_dialog::{show_connect_dialog, show_disconnect_confirm_dialog};
 use crate::ui::history::setup_history;
-use crate::ui::ConnectionVisibilityFn;
+use crate::ui::{media_stream_error_message, ConnectionVisibilityFn};
 
 const SCHEMA_ID: &str = "com.weiz.vnc-client-adwaita";
 
@@ -199,6 +199,12 @@ pub fn build_ui(app: &adw::Application) {
         set_connection_visible,
         move |msg: String| {
             log::error!("VNC error: {}", msg);
+            if let Some(media_msg) = media_stream_error_message(&msg) {
+                // Media stream failures are non-fatal: keep the RFB connection
+                // alive and only notify the user that H.264 mode is unavailable.
+                toast_overlay.add_toast(adw::Toast::new(&media_msg));
+                return;
+            }
             toast_overlay.add_toast(adw::Toast::new(&msg));
             connect_btn.set_sensitive(true);
             connect_btn.set_label(&gettext("Connect"));
